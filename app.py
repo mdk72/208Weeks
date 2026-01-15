@@ -420,8 +420,14 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
         # "시뮬레이션 종료일" 기준으로 스크리너와 동일한 함수를 직접 호출하여 확인
         try:
             lookback = config.get('lookback', 208)
-            # [FIX] df_daily 대신 날짜 필터링된 df_test 사용 -> 과거 시점 백테스트 시 미래 데이터 참조 방지
-            core_res = analyze_stock_core(ticker, name, df_test, lookback)
+            end_date_ts = pd.Timestamp(config.get('end_date'))
+            
+            # [CRITICAL FIX] df_test가 아닌 df_daily 전체를 end_date까지 필터링해서 사용
+            # df_test는 start_date부터 시작하므로 짧은 기간(15일 등) 설정 시 데이터 부족으로 검증 실패
+            # 스크리너는 전체 히스토리를 사용하므로, 백테스트도 동일하게 충분한 히스토리 제공 필요
+            df_for_core = df_daily[df_daily.index <= end_date_ts]
+            
+            core_res = analyze_stock_core(ticker, name, df_for_core, lookback)
             if core_res:
                 log_txt += " [Core:BUY]"
                 # 만약 Core는 Buy인데 trades에 신규 신호가 없다면? -> 강제 추가
@@ -430,11 +436,11 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                     if position is None: # 보유 중이 아닐 때만
                         log_txt += "(Added by Core)"
                         trades.append({
-                            # df_test의 마지막 날짜 사용
-                            'entry_date': df_test.index[-1],
-                            'entry_price': float(df_test['Close'].iloc[-1]),
+                            # 종료일 기준 데이터 사용
+                            'entry_date': df_for_core.index[-1],
+                            'entry_price': float(df_for_core['Close'].iloc[-1]),
                             'exit_date': None,
-                            'exit_price': float(df_test['Close'].iloc[-1]),
+                            'exit_price': float(df_for_core['Close'].iloc[-1]),
                             'pnl': 0.0,
                             'duration': 0,
                             'segments': core_res['segments'],
@@ -445,8 +451,8 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
             else:
                  log_txt += " [Core:NO]"
         except Exception as e:
-            # df_test가 비어있거나 하면 에러 날 수 있음
-            pass
+            # df_for_core가 비어있거나 하면 에러 날 수 있음
+            log_txt += f" [CoreErr:{str(e)[:30]}]"
                     
         # trades가 있거나, 디버그 메시지가 "Added" 또는 "Updated"를 포함하면 반환
         if trades:
@@ -564,7 +570,16 @@ with st.sidebar:
 tab1, tab2 = st.tabs(["📊 실시간 스크리너", "🧪 백테스팅"])
 
 with tab1:
-    if st.button("🔥 실시간 종목 스캔 시작"):
+    st.markdown("### 📍 실시간 종목 스크린")
+    
+    # [New] 검색 날짜 선택 (백테스트 검증용)
+    scan_date = st.date_input(
+        "검색 기준 날짜",
+        value=datetime.now().date(),
+        help="이 날짜 기준으로 조건을 만족하는 종목을 검색합니다. 백테스트 결과와 비교 검증 시 유용합니다."
+    )
+    
+    if st.button("� 실시간 종목 스캔 시작"):
         stock_list = get_stock_list_naver(market_sel, n_stocks_sel)
         results = []
         pb = st.progress(0)
@@ -581,27 +596,47 @@ with tab1:
                 stock_row = future_to_stock[future]
                 try:
                     df = future.result()
-                    if df is not None:
-                        # [FIX] 실시간 가격 반영 (Robust Injection)
+                    if df is not None and not df.empty:
+                        # [Chart] 차트용 원본 데이터 보존 (전체 기간 표시)
+                        df_full_for_chart = df.copy()
+                        
+                        # [New] 선택된 날짜 기준으로 데이터 필터링 (분석용)
+                        target_date = pd.Timestamp(scan_date)
+                        df = df[df.index <= target_date]
+                        
+                        if df.empty:
+                            fail_count += 1
+                            continue
+                        
+                        # [FIX] 가격 반영 로직 (선택 날짜 기준)
                         cur_p = stock_row.get('현재가', 0)
-                        if cur_p > 0 and not df.empty:
-                            last_date = df.index[-1]
-                            today = pd.Timestamp(datetime.now().date())
-                            
+                        last_date = df.index[-1]
+                        today = pd.Timestamp(datetime.now().date())
+                        
+                        # 오늘 날짜를 선택한 경우: 실시간 가격 사용
+                        if scan_date == today.date() and cur_p > 0:
                             # 데이터가 과거면 Append (새로운 주봉 생성 가능)
                             if last_date.date() < today.date():
                                 new_row = pd.DataFrame({
                                     'Open': [cur_p], 'High': [cur_p], 'Low': [cur_p], 'Close': [cur_p], 'Volume': [0]
                                 }, index=[today])
                                 df = pd.concat([df, new_row])
+                                df_full_for_chart = pd.concat([df_full_for_chart, new_row])  # 차트용도 업데이트
                             # 오늘 데이터면 Update
                             elif last_date.date() == today.date():
                                 df.at[last_date, 'Close'] = cur_p
                                 if cur_p > df.at[last_date, 'High']: df.at[last_date, 'High'] = cur_p
                                 if cur_p < df.at[last_date, 'Low']: df.at[last_date, 'Low'] = cur_p
+                                # 차트용도 동일하게 업데이트
+                                df_full_for_chart.at[last_date, 'Close'] = cur_p
+                                if cur_p > df_full_for_chart.at[last_date, 'High']: df_full_for_chart.at[last_date, 'High'] = cur_p
+                                if cur_p < df_full_for_chart.at[last_date, 'Low']: df_full_for_chart.at[last_date, 'Low'] = cur_p
+                        # 과거 날짜 선택: 해당 날짜의 종가 사용 (실시간 가격 무시)
 
                         res = analyze_stock_core(stock_row['Code'], stock_row['Name'], df, lookback_sel)
-                        if res: 
+                        if res:
+                            # 차트는 전체 기간 표시하도록 원본 데이터로 교체
+                            res['df_daily'] = df_full_for_chart
                             results.append(res)
                             success_count += 1
                         else:
@@ -741,9 +776,19 @@ with tab2:
         df_summary.loc[mask_held_rescreened, 'Recent Sell'] = '✅ 보유중 (Screener)'
 
         # [Visualization] 스크리너 검색일(Screener Date) 추가
-        # 스크리너에 뜬 종목(is_core_buy)은 "현재 시점(bt_end)"에 검색되었음을 명시
+        # "시뮬레이션 종료일 기준으로 조건을 만족하는 종목"만 표시
+        # (과거 매수 여부와 무관하게, 현재 조건 만족 여부만 체크)
         sim_date_str = bt_end.strftime('%Y-%m-%d')
         df_summary['Screener Date'] = df_summary['is_core_buy'].apply(lambda x: sim_date_str if x else '-')
+
+        # [Filter] 시뮬레이션 기간 내 매수 신호가 있는 종목만 표시
+        # 사용자 설정 기간(bt_start ~ bt_end) 이전 매수는 무시하고, 기간 내 신호만 보여줌
+        start_date_filter = pd.Timestamp(bt_start)  # Streamlit date -> pandas Timestamp 변환
+        mask_recent_activity = (
+            (df_summary['Recent Buy'] >= start_date_filter) |  # 기간 내 매수
+            (df_summary['Screener Date'] != '-')  # 또는 종료일 기준 스크리너 일치
+        )
+        df_summary = df_summary[mask_recent_activity].copy()
 
         # 정렬 순서: 1. 신규 매수, 2. 스크리너 일치 종목(보유중 포함), 3. 최근 매수일
         df_summary = df_summary.sort_values(
