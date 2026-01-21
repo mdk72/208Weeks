@@ -103,7 +103,7 @@ def fetch_data(ticker, market, start_date="2016-01-01"):
     yf_ticker = ticker + (".KS" if market == "KOSPI" else ".KQ")
     cached_df = get_cached_data(ticker, start_date)
     if cached_df is not None:
-        return cached_df
+        return cached_df, True  # (데이터, 캐시_사용_여부)
     
     try:
         # yfinance 호출 실패 시 재시도 로직 없이 바로 실패 처리 (쓰로틀링 우선)
@@ -113,10 +113,10 @@ def fetch_data(ticker, market, start_date="2016-01-01"):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         save_to_cache(ticker, df)
-        return df
+        return df, False  # (데이터, 캐시_사용_여부)
     except Exception as e:
         # print(f"Fetch Error ({ticker}): {e}") # 로그 과다 방지
-        return None
+        return None, False
 
 
 def analyze_stock_core(ticker, name, df, lookback_weeks=208):
@@ -181,7 +181,11 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
         if pre_fetched_df is not None:
             df_daily = pre_fetched_df.copy()
         else:
-            df_daily = fetch_data(ticker, market)
+            result = fetch_data(ticker, market)
+            if result is None:
+                df_daily = None
+            else:
+                df_daily, _ = result  # 캐시 여부는 무시
             
         lookback_days = config.get('lookback', 208)
         # [Sync] 스크리너와 동일한 최소 길이 조건 적용 (기존 1000일 -> lookback일)
@@ -457,6 +461,9 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
         # trades가 있거나, 디버그 메시지가 "Added" 또는 "Updated"를 포함하면 반환
         if trades:
             last_buy = trades[-1]['entry_date'].strftime('%Y-%m-%d')
+            # 현재 수익률 계산 (보유중/신규일 경우만)
+            current_pnl = trades[-1]['pnl'] if (trades[-1]['exit_date'] is None or trades[-1].get('is_new_signal', False)) else None
+            
             # 신규 매수 신호인지 확인
             if trades[-1].get('is_new_signal', False):
                 last_sell = '🆕 신규'
@@ -469,24 +476,27 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                 'Ticker': ticker, 'Name': name, 'Total PnL (%)': sum(t['pnl'] for t in trades),
                 'Trades': len(trades), 'Win Rate (%)': (len([t for t in trades if t['pnl'] > 0]) / len(trades)) * 100,
                 'Recent Buy': last_buy, 'Recent Sell': last_sell,
+                'Current PnL (%)': current_pnl,  # 현재 수익률 추가
                 'df_daily': df_daily, 'trades': trades,
-                'DebugInfo': debug_msg, 'Log': log_txt
+                'DebugInfo': debug_msg
             }
         elif "Added" in debug_msg or "Updated" in debug_msg or log_txt:
              return {
                 'Ticker': ticker, 'Name': name, 'Total PnL (%)': 0.0,
                 'Trades': 0, 'Win Rate (%)': 0.0,
                 'Recent Buy': '-', 'Recent Sell': '-',
+                'Current PnL (%)': None,
                 'df_daily': df_daily, 'trades': [],
-                'DebugInfo': debug_msg, 'Log': log_txt
+                'DebugInfo': debug_msg
             }
     except Exception as e:
         return {
             'Ticker': ticker, 'Name': name, 'Total PnL (%)': 0.0,
             'Trades': 0, 'Win Rate (%)': 0.0,
             'Recent Buy': '-', 'Recent Sell': '-',
+            'Current PnL (%)': None,
             'df_daily': None, 'trades': [],
-            'DebugInfo': f"Error: {e}", 'Log': str(e)
+            'DebugInfo': f"Error: {e}"
         }
     return None
     return None
@@ -585,8 +595,10 @@ with tab1:
         pb = st.progress(0)
         st_txt = st.empty()
         
-        # 안정성을 위해 병렬 처리 개수 조정 (2~4)
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        # 병렬 처리 최적화 (6 workers)
+        cache_hit = 0
+        cache_miss = 0
+        with ThreadPoolExecutor(max_workers=6) as executor:
             future_to_stock = {executor.submit(fetch_data, row['Code'], market_sel): row for _, row in stock_list.iterrows()}
             
             success_count = 0
@@ -595,7 +607,17 @@ with tab1:
             for i, future in enumerate(as_completed(future_to_stock)):
                 stock_row = future_to_stock[future]
                 try:
-                    df = future.result()
+                    result = future.result()
+                    if result is None:
+                        fail_count += 1
+                        continue
+                    
+                    df, from_cache = result
+                    if from_cache:
+                        cache_hit += 1
+                    else:
+                        cache_miss += 1
+                    
                     if df is not None and not df.empty:
                         # [Chart] 차트용 원본 데이터 보존 (전체 기간 표시)
                         df_full_for_chart = df.copy()
@@ -649,12 +671,18 @@ with tab1:
                 
                 # 진행률 및 상태 표시 업데이트
                 pb.progress((i + 1) / n_stocks_sel)
-                st_txt.text(f"분석 중... ({i+1}/{n_stocks_sel}) | 발견: {len(results)}개")
+                cache_rate = (cache_hit / (cache_hit + cache_miss) * 100) if (cache_hit + cache_miss) > 0 else 0
+                st_txt.text(f"분석 중... ({i+1}/{n_stocks_sel}) | 발견: {len(results)}개 | 캐시: {cache_rate:.0f}% ({cache_hit}/{cache_hit+cache_miss})")
+        
+        # 스캔 완료 통계
+        total_scanned = cache_hit + cache_miss
+        cache_rate = (cache_hit / total_scanned * 100) if total_scanned > 0 else 0
         
         if results:
             st.session_state['scan_results'] = results
             st.session_state['scan_market'] = market_sel
             st.session_state['scan_date'] = scan_date  # 검색 날짜 저장
+            st.info(f"📊 **성능 통계** | 캐시 활용: {cache_rate:.1f}% ({cache_hit}/{total_scanned}) | API 호출: {cache_miss}회")
         else: 
             st.warning("결과가 없습니다.")
 
@@ -721,7 +749,7 @@ with tab1:
             hovermode='x unified',
             showlegend=True
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 with tab2:
     st.subheader("초고속 백테스팅")
@@ -820,7 +848,8 @@ with tab2:
         # [FIX] Recent Sell은 '보유중', '신규' 등 텍스트가 섞여있으므로 datetime 변환 금지 (변환 시 NaT가 되어 로직 깨짐)
         
         # [Visualization] 스크리너 일치 여부 확인 (Core:BUY)
-        df_summary['is_core_buy'] = df_summary['Log'].fillna('').apply(lambda x: '[Core:BUY]' in x)
+        # Log 컬럼이 제거되었으므로 DebugInfo 사용 (없으면 빈 문자열)
+        df_summary['is_core_buy'] = df_summary.get('DebugInfo', pd.Series([''] * len(df_summary))).fillna('').apply(lambda x: '[Core:BUY]' in str(x) if x else False)
         df_summary['is_new_signal'] = df_summary['Recent Sell'] == '🆕 신규'
 
         # "보유중"인데 스크리너에도 뜬 종목 표시
@@ -854,9 +883,9 @@ with tab2:
         # 맨 앞에 명시적인 행 번호 컬럼 추가
         df_summary.insert(0, '#', range(len(df_summary)))
         
-        # 컬럼 순서 재배치 (Screener Date를 잘 보이는 곳으로)
-        cols = ['#', 'Ticker', 'Name', 'Total PnL (%)', 'Trades', 'Win Rate (%)', 'Recent Buy', 'Screener Date', 'Recent Sell', 'DebugInfo', 'Log']
-        # 나머지 컬럼들(is_core_buy 등) 뒤에 붙이기
+        # 컬럼 순서 재배치 (Current PnL 추가, Log 제거)
+        cols = ['#', 'Ticker', 'Name', 'Total PnL (%)', 'Trades', 'Win Rate (%)', 'Recent Buy', 'Screener Date', 'Recent Sell', 'Current PnL (%)']
+        # 나머지 컬럼들(is_core_buy, DebugInfo 등) 뒤에 붙이기
         existing_cols = df_summary.columns.tolist()
         final_cols = [c for c in cols if c in existing_cols] + [c for c in existing_cols if c not in cols]
         df_summary = df_summary[final_cols]
