@@ -652,24 +652,76 @@ with tab1:
                 st_txt.text(f"분석 중... ({i+1}/{n_stocks_sel}) | 발견: {len(results)}개")
         
         if results:
-            st.success(f"스캔 완료! {len(results)}개 종목 분석")
-            df_disp = pd.DataFrame(results).drop(columns=['df_daily', 'segments'])
-            st.dataframe(df_disp, width='stretch')
             st.session_state['scan_results'] = results
             st.session_state['scan_market'] = market_sel
-        else: st.warning("결과가 없습니다.")
+            st.session_state['scan_date'] = scan_date  # 검색 날짜 저장
+        else: 
+            st.warning("결과가 없습니다.")
 
+    # 스캔 결과 표시 (항상 표시)
     if 'scan_results' in st.session_state:
+        st.success(f"스캔 완료! {len(st.session_state['scan_results'])}개 종목 분석")
+        df_disp = pd.DataFrame(st.session_state['scan_results']).drop(columns=['df_daily', 'segments'])
+        st.dataframe(df_disp, width='stretch')
         st.divider()
         scan_results = st.session_state['scan_results']
         sel_name = st.selectbox("종목 선택", [res['Name'] for res in scan_results], key="scan_sel")
         row_sel = next(res for res in scan_results if res['Name'] == sel_name)
+        
+        # 차트 데이터 준비
+        df_chart = row_sel['df_daily'].copy()
+        df_chart['MA20'] = df_chart['Close'].rolling(window=20).mean()
+        
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=row_sel['df_daily'].index, y=row_sel['df_daily']['Close'], name='Price', line=dict(color='#26a69a')))
+        
+        # 가격 라인
+        fig.add_trace(go.Scatter(
+            x=df_chart.index, 
+            y=df_chart['Close'], 
+            name='가격', 
+            line=dict(color='#26a69a', width=2)
+        ))
+        
+        # 20일 이동평균선
+        fig.add_trace(go.Scatter(
+            x=df_chart.index, 
+            y=df_chart['MA20'], 
+            name='20일선', 
+            line=dict(color='#ff9800', width=1, dash='dot'),
+            opacity=0.7
+        ))
+        
+        # 매수 시점 표시 (검색 기준 날짜)
+        scan_date_ts = pd.Timestamp(st.session_state.get('scan_date', datetime.now().date()))
+        # 검색 날짜에 가장 가까운 실제 데이터 찾기
+        valid_dates = df_chart[df_chart.index <= scan_date_ts].index
+        if len(valid_dates) > 0:
+            buy_date = valid_dates[-1]  # 검색일 이전 가장 최근 데이터
+            buy_price = df_chart.loc[buy_date, 'Close']
+            fig.add_trace(go.Scatter(
+                x=[buy_date], 
+                y=[buy_price],
+                mode='markers+text',
+                name='매수 시점',
+                marker=dict(color='#00ff00', size=15, symbol='triangle-up'),
+                text=['🟢 BUY'],
+                textposition='top center',
+                textfont=dict(size=14, color='#00ff00')
+            ))
+        
+        # 6등분 경계선
         for i, level in enumerate(row_sel['segments']):
             fig.add_hline(y=level, line_dash="dash", line_color="rgba(200,200,200,0.2)")
-        fig.update_layout(template="plotly_dark", height=600, paper_bgcolor="#131722", plot_bgcolor="#131722")
-        st.plotly_chart(fig, width='stretch')
+        
+        fig.update_layout(
+            template="plotly_dark", 
+            height=600, 
+            paper_bgcolor="#131722", 
+            plot_bgcolor="#131722",
+            hovermode='x unified',
+            showlegend=True
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
 with tab2:
     st.subheader("초고속 백테스팅")
