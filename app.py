@@ -119,6 +119,79 @@ def fetch_data(ticker, market, start_date="2016-01-01"):
         return None, False
 
 
+def calculate_screener_performance(df_daily, entry_date, entry_price, segments):
+    """
+    스크리너 검색일 기준 성과 지표 계산
+    - 검색일에 매수했다고 가정
+    - 전략 조건에 따라 매도 시점 계산
+    - Max/Min 수익률 및 날짜 반환
+    """
+    try:
+        # 검색일 이후 데이터만 추출
+        df_after = df_daily[df_daily.index > entry_date].copy()
+        if df_after.empty:
+            return None
+        
+        # 20일 이동평균 계산
+        df_after['MA20'] = df_after['Close'].rolling(window=20).mean()
+        
+        # 매도 시점 찾기 (간단한 전략: D/E 도달 후 20일선 이탈)
+        de_line = segments[4]  # D/E 경계
+        exit_date = None
+        exit_price = None
+        target_hit = False
+        
+        for i in range(len(df_after)):
+            curr_price = df_after['Close'].iloc[i]
+            curr_ma20 = df_after['MA20'].iloc[i]
+            
+            if curr_price >= de_line:
+                target_hit = True
+            
+            if target_hit and pd.notna(curr_ma20) and curr_price < curr_ma20:
+                exit_date = df_after.index[i]
+                exit_price = curr_price
+                break
+        
+        # 매도 시점 결정 (매도 신호 없으면 오늘까지)
+        if exit_date is None:
+            analysis_end = df_after.index[-1]
+            analysis_df = df_after
+            status = "보유중"
+        else:
+            analysis_end = exit_date
+            analysis_df = df_after[df_after.index <= exit_date]
+            status = f"매도 ({exit_date.strftime('%Y-%m-%d')})"
+        
+        # 수익률 계산
+        if exit_date is None:
+            current_pnl = (df_after['Close'].iloc[-1] - entry_price) / entry_price * 100
+        else:
+            current_pnl = (exit_price - entry_price) / entry_price * 100
+        
+        # Max/Min 계산
+        max_price = analysis_df['High'].max()
+        min_price = analysis_df['Low'].min()
+        max_pnl = (max_price - entry_price) / entry_price * 100
+        min_pnl = (min_price - entry_price) / entry_price * 100
+        
+        # Max/Min 날짜
+        max_date = analysis_df[analysis_df['High'] == max_price].index[0]
+        min_date = analysis_df[analysis_df['Low'] == min_price].index[0]
+        
+        return {
+            '수익률': current_pnl,
+            'Max 수익률': max_pnl,
+            'Max 날짜': max_date.strftime('%Y-%m-%d'),
+            'Min 수익률': min_pnl,
+            'Min 날짜': min_date.strftime('%Y-%m-%d'),
+            '상태': status
+        }
+    except Exception as e:
+        return None
+
+
+
 def analyze_stock_core(ticker, name, df, lookback_weeks=208):
     try:
         if df is None or len(df) < lookback_weeks: return None
@@ -148,13 +221,18 @@ def analyze_stock_core(ticker, name, df, lookback_weeks=208):
             
         curr_seg = "Segment C"
         
-        # Condition 2: Golden Cross over B/C line within last 12 weeks (Rising Logic)
+        # Condition 2: Golden Cross over B/C line within last 60 days (Rising Logic)
         # 하락하다가 멈춘게 아니라, "밑에서 치고 올라온" 종목이어야 함.
-        # 즉, 최근 12주(약 3달) 내에 최저가가 B/C 라인보다 낮았어야 함 (돌파 발생 확인)
-        # [FIX] daily df이므로 12는 12일임. 12주=60일로 수정.
+        # 최근 60일 내에 최저가가 B/C 라인보다 낮았어야 함 (돌파 발생 확인)
         recent_low = df['Low'].tail(60).min()
         if recent_low >= bc_line:
             return None # 최근에 B/C 밑에 있었던 적이 없으면(계속 위에 있었거나 위에서 내려옴) 탈락
+        
+        # Condition 2-2: B/C 라인 근처만 선택 (과도하게 상승한 종목 제외)
+        # B/C 돌파 후 5% 이내 종목만 스크린
+        max_rise_from_bc = 0.05  # 5% 제한 (조정 가능)
+        if current_price > bc_line * (1 + max_rise_from_bc):
+            return None  # B/C + 5% 초과 시 탈락
         
         # Condition 3: Above 20MA
         df_temp = df.tail(30).copy()
@@ -167,10 +245,13 @@ def analyze_stock_core(ticker, name, df, lookback_weeks=208):
         ma_status = "O (Above)"
         
         return {
-            'Code': ticker, 'Name': name, '현재가': current_price,
+            'Code': ticker, 'Name': name, 
+            '매수가': current_price,  # 검색일 종가
             '208주 최저': low_208, '208주 최고': high_208,
             '현재 구간': curr_seg, '20일선': ma_status,
             'df_daily': df, 'segments': segments,
+            'B/C 라인': bc_line,  # B/C 라인 추가
+            'B/C 상승률': ((current_price - bc_line) / bc_line * 100),  # B/C 대비 상승률
             'recent_low': recent_low # 디버깅용
         }
     except:
@@ -655,10 +736,26 @@ with tab1:
                                 if cur_p < df_full_for_chart.at[last_date, 'Low']: df_full_for_chart.at[last_date, 'Low'] = cur_p
                         # 과거 날짜 선택: 해당 날짜의 종가 사용 (실시간 가격 무시)
 
-                        res = analyze_stock_core(stock_row['Code'], stock_row['Name'], df, lookback_sel)
+                        # [FIX] 검색일 기준으로 분석하도록 데이터 자르기
+                        scan_date_ts = pd.Timestamp(scan_date)
+                        df_until_scan = df[df.index <= scan_date_ts].copy()
+                        
+                        res = analyze_stock_core(stock_row['Code'], stock_row['Name'], df_until_scan, lookback_sel)
                         if res:
                             # 차트는 전체 기간 표시하도록 원본 데이터로 교체
                             res['df_daily'] = df_full_for_chart
+                            
+                            # 현재가 추가 (오늘 종가)
+                            res['현재가'] = float(df_full_for_chart['Close'].iloc[-1])
+                            
+                            # 성과 지표 계산 (검색일 기준)
+                            entry_date = pd.Timestamp(scan_date)
+                            entry_price = res['매수가']  # 검색일 종가
+                            perf = calculate_screener_performance(df_full_for_chart, entry_date, entry_price, res['segments'])
+                            
+                            if perf:
+                                res.update(perf)  # 수익률, Max/Min, 상태 추가
+                            
                             results.append(res)
                             success_count += 1
                         else:
@@ -683,13 +780,47 @@ with tab1:
             st.session_state['scan_market'] = market_sel
             st.session_state['scan_date'] = scan_date  # 검색 날짜 저장
             st.info(f"📊 **성능 통계** | 캐시 활용: {cache_rate:.1f}% ({cache_hit}/{total_scanned}) | API 호출: {cache_miss}회")
-        else: 
+        else:
+            # 결과가 없으면 이전 결과 초기화
+            if 'scan_results' in st.session_state:
+                del st.session_state['scan_results']
             st.warning("결과가 없습니다.")
 
     # 스캔 결과 표시 (항상 표시)
     if 'scan_results' in st.session_state:
         st.success(f"스캔 완료! {len(st.session_state['scan_results'])}개 종목 분석")
-        df_disp = pd.DataFrame(st.session_state['scan_results']).drop(columns=['df_daily', 'segments'])
+        
+        # DataFrame 생성 및 컬럼 정리
+        df_disp = pd.DataFrame(st.session_state['scan_results']).drop(columns=['df_daily', 'segments', 'recent_low'], errors='ignore')
+        
+        # 컬럼 순서 재정렬 (가독성 최적화)
+        preferred_cols = [
+            'Code', 'Name', '매수가', '현재가', 'B/C 라인', 'B/C 상승률', 
+            '수익률', 'Max 수익률', 'Max 날짜', 'Min 수익률', 'Min 날짜', '상태',
+            '208주 최저', '208주 최고', '현재 구간', '20일선'
+        ]
+        
+        # 존재하는 컬럼만 선택
+        cols_to_show = [c for c in preferred_cols if c in df_disp.columns]
+        df_disp = df_disp[cols_to_show]
+        
+        # 숫자 포맷팅
+        # 가격 컬럼: 소수점 제거 (정수로 표시)
+        price_cols = ['매수가', '현재가', 'B/C 라인', '208주 최저', '208주 최고']
+        for col in price_cols:
+            if col in df_disp.columns:
+                df_disp[col] = df_disp[col].apply(lambda x: f"{int(x):,}" if pd.notna(x) else x)
+        
+        # 퍼센트 컬럼: 포맷팅
+        if 'B/C 상승률' in df_disp.columns:
+            df_disp['B/C 상승률'] = df_disp['B/C 상승률'].apply(lambda x: f"+{x:.1f}%" if x > 0 else f"{x:.1f}%")
+        if '수익률' in df_disp.columns:
+            df_disp['수익률'] = df_disp['수익률'].apply(lambda x: f"+{x:.1f}%" if x > 0 else f"{x:.1f}%")
+        if 'Max 수익률' in df_disp.columns:
+            df_disp['Max 수익률'] = df_disp['Max 수익률'].apply(lambda x: f"+{x:.1f}%" if x > 0 else f"{x:.1f}%")
+        if 'Min 수익률' in df_disp.columns:
+            df_disp['Min 수익률'] = df_disp['Min 수익률'].apply(lambda x: f"+{x:.1f}%" if x > 0 else f"{x:.1f}%")
+        
         st.dataframe(df_disp, width='stretch')
         st.divider()
         scan_results = st.session_state['scan_results']
@@ -736,6 +867,30 @@ with tab1:
                 textposition='top center',
                 textfont=dict(size=14, color='#00ff00')
             ))
+        
+        # 매도 시점 표시 (매도된 경우만)
+        if '상태' in row_sel and '매도' in row_sel['상태']:
+            # 상태에서 날짜 추출: "매도 (2025-07-01)" -> "2025-07-01"
+            import re
+            match = re.search(r'\((\d{4}-\d{2}-\d{2})\)', row_sel['상태'])
+            if match:
+                sell_date_str = match.group(1)
+                sell_date_ts = pd.Timestamp(sell_date_str)
+                # 매도일에 가장 가까운 실제 데이터 찾기
+                valid_sell_dates = df_chart[df_chart.index <= sell_date_ts].index
+                if len(valid_sell_dates) > 0:
+                    sell_date = valid_sell_dates[-1]
+                    sell_price = df_chart.loc[sell_date, 'Close']
+                    fig.add_trace(go.Scatter(
+                        x=[sell_date],
+                        y=[sell_price],
+                        mode='markers+text',
+                        name='매도 시점',
+                        marker=dict(color='#ff0000', size=15, symbol='triangle-down'),
+                        text=['🔴 SELL'],
+                        textposition='bottom center',
+                        textfont=dict(size=14, color='#ff0000')
+                    ))
         
         # 6등분 경계선
         for i, level in enumerate(row_sel['segments']):
