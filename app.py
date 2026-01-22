@@ -42,21 +42,53 @@ def init_db():
         conn.commit()
         conn.close()
 
-def get_cached_data(ticker, start_date):
+def get_cached_data(ticker, requested_start_date):
     if not os.path.exists(CACHE_DB): return None
     try:
         with db_lock:
             conn = sqlite3.connect(CACHE_DB)
             cursor = conn.cursor()
+            
+            # [HOTFIX] Check the earliest date cached for this ticker
+            cursor.execute("SELECT MIN(date) FROM price_data WHERE ticker = ?", (ticker,))
+            min_date_row = cursor.fetchone()
+            
+            if min_date_row and min_date_row[0]:
+                cached_min_date_str = min_date_row[0]
+                cached_min_date = datetime.strptime(cached_min_date_str, '%Y-%m-%d').date()
+                requested_start_date_obj = datetime.strptime(requested_start_date, '%Y-%m-%d').date()
+                
+                # [FIX] Allow 7-day grace period for holidays/weekends
+                # If cached data starts more than 7 days AFTER requested, we need more history
+                if cached_min_date > (requested_start_date_obj + timedelta(days=7)):
+                    conn.close()
+                    return None
+
             cursor.execute("SELECT last_updated FROM cache_meta WHERE ticker = ?", (ticker,))
             row = cursor.fetchone()
             
             today_str = datetime.now().strftime('%Y-%m-%d')
             if row and row[0] == today_str:
-                df = pd.read_sql_query("SELECT * FROM price_data WHERE ticker = ? AND date >= ?", conn, params=(ticker, start_date))
+                df = pd.read_sql_query("SELECT * FROM price_data WHERE ticker = ? AND date >= ?", conn, params=(ticker, requested_start_date))
                 conn.close()
                 if not df.empty:
                     df['date'] = pd.to_datetime(df['date'])
+                    
+                    # [NEW] Data completeness check
+                    last_data_date = df['date'].max()
+                    current_time = datetime.now()
+                    
+                    # If after market close (15:30), today's data should exist
+                    market_close = current_time.replace(hour=15, minute=30, second=0, microsecond=0)
+                    
+                    if current_time > market_close:
+                        # Check if today's data exists
+                        today_date = pd.Timestamp(today_str)
+                        if last_data_date < today_date:
+                            # [FIX] Instead of just returning None (which might hit cache again), 
+                            # we should probably continue to fetch_data to update it.
+                            return None  # Invalidate cache
+                    
                     df.set_index('date', inplace=True)
                     df.columns = [c.capitalize() for c in df.columns]
                     return df
@@ -96,9 +128,9 @@ def save_to_cache(ticker, df):
 import time
 import random
 
-def fetch_data(ticker, market, start_date="2016-01-01"):
-    # Rate Limit 방지: 랜덤 딜레이 (속도 향상을 위해 최소화: 0.05~0.1초)
-    time.sleep(random.uniform(0.05, 0.1))
+def fetch_data(ticker, market, start_date="2010-01-01"):
+    # Rate Limit 방지: 랜덤 딜레이 (0.2~0.4초)
+    time.sleep(random.uniform(0.2, 0.4))
     
     yf_ticker = ticker + (".KS" if market == "KOSPI" else ".KQ")
     cached_df = get_cached_data(ticker, start_date)
@@ -129,7 +161,9 @@ def calculate_screener_performance(df_daily, entry_date, entry_price, segments):
     try:
         # 검색일 이후 데이터만 추출
         df_after = df_daily[df_daily.index > entry_date].copy()
+        print(f"[DEBUG] Entry Date: {entry_date}, Data After: {len(df_after)} rows, Last Date: {df_daily.index[-1] if len(df_daily) > 0 else 'N/A'}")
         if df_after.empty:
+            print(f"[DEBUG] No data after entry_date {entry_date}. Returning None.")
             return None
         
         # 20일 이동평균 계산
@@ -188,11 +222,14 @@ def calculate_screener_performance(df_daily, entry_date, entry_price, segments):
             '상태': status
         }
     except Exception as e:
+        print(f"[DEBUG] Performance calculation error: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
 
-def analyze_stock_core(ticker, name, df, lookback_weeks=208):
+def analyze_stock_core(ticker, name, df, lookback_weeks=208, bc_breakout_days=60):
     try:
         if df is None or len(df) < lookback_weeks: return None
         df_weekly = df.resample('W').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'})
@@ -221,10 +258,10 @@ def analyze_stock_core(ticker, name, df, lookback_weeks=208):
             
         curr_seg = "Segment C"
         
-        # Condition 2: Golden Cross over B/C line within last 60 days (Rising Logic)
+        # Condition 2: Golden Cross over B/C line within last N days (Rising Logic)
         # 하락하다가 멈춘게 아니라, "밑에서 치고 올라온" 종목이어야 함.
-        # 최근 60일 내에 최저가가 B/C 라인보다 낮았어야 함 (돌파 발생 확인)
-        recent_low = df['Low'].tail(60).min()
+        # 최근 N일 내에 최저가가 B/C 라인보다 낮았어야 함 (돌파 발생 확인)
+        recent_low = df['Low'].tail(bc_breakout_days).min()
         if recent_low >= bc_line:
             return None # 최근에 B/C 밑에 있었던 적이 없으면(계속 위에 있었거나 위에서 내려옴) 탈락
         
@@ -276,8 +313,7 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                 'Ticker': ticker, 'Name': name, 'Total PnL (%)': 0.0,
                 'Trades': 0, 'Win Rate (%)': 0.0,
                 'Recent Buy': '-', 'Recent Sell': '-',
-                'df_daily': None, 'trades': [],
-                'DebugInfo': "Data Short", 'Log': f"Data len({len(df_daily) if df_daily is not None else 0}) < {lookback_days}"
+                'df_daily': None, 'trades': []
             }
         
         # 실시간 데이터 반영 (캐시된 데이터가 오늘짜가 아닐 경우 또는 업데이트)
@@ -365,7 +401,9 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                     
                 if is_buy and buy_breakout:
                     bnd = bounds[2] if buy_segment == "Segment C (B/C~C/D)" else bounds[1]
-                    was_below = float(df_test['Close'].iloc[max(0, i-5):i].min()) <= bnd
+                    # [FIX] 스크리너와 동기화: config의 bc_breakout_days 사용
+                    bc_days = config.get('bc_breakout_days', 60)
+                    was_below = float(df_test['Close'].iloc[max(0, i-bc_days):i].min()) <= bnd
                     if not was_below: is_buy = False
                     
                 if is_buy and buy_ma20 and curr_price < ma20: is_buy = False
@@ -541,7 +579,20 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                     
         # trades가 있거나, 디버그 메시지가 "Added" 또는 "Updated"를 포함하면 반환
         if trades:
-            last_buy = trades[-1]['entry_date'].strftime('%Y-%m-%d')
+            # Screener Date: 현재 보유 중인 포지션의 최초 매수일
+            # 보유 중이면 마지막 거래의 entry_date, 매도 완료면 trade 중 exit_date=None인 것 찾기
+            last_trade = trades[-1]
+            if last_trade['exit_date'] is None or last_trade.get('is_new_signal', False):
+                # 보유중 또는 신규: 마지막 거래의 매수일
+                last_buy = last_trade['entry_date'].strftime('%Y-%m-%d')
+            else:
+                # 매도 완료: 마지막으로 보유했던 거래 찾기 (없으면 마지막 거래)
+                held_trades = [t for t in trades if t['exit_date'] is None]
+                if held_trades:
+                    last_buy = held_trades[-1]['entry_date'].strftime('%Y-%m-%d')
+                else:
+                    last_buy = last_trade['entry_date'].strftime('%Y-%m-%d')
+            
             # 현재 수익률 계산 (보유중/신규일 경우만)
             current_pnl = trades[-1]['pnl'] if (trades[-1]['exit_date'] is None or trades[-1].get('is_new_signal', False)) else None
             
@@ -556,28 +607,21 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
             return {
                 'Ticker': ticker, 'Name': name, 'Total PnL (%)': sum(t['pnl'] for t in trades),
                 'Trades': len(trades), 'Win Rate (%)': (len([t for t in trades if t['pnl'] > 0]) / len(trades)) * 100,
-                'Recent Buy': last_buy, 'Recent Sell': last_sell,
+                'Recent Buy': last_buy, 
+                'Recent Buy Price': last_trade['entry_price'],
+                'Recent Sell': last_sell,
+                'Recent Sell Price': last_trade['exit_price'],
                 'Current PnL (%)': current_pnl,  # 현재 수익률 추가
-                'df_daily': df_daily, 'trades': trades,
-                'DebugInfo': debug_msg
+                'df_daily': df_daily, 'trades': []
             }
-        elif "Added" in debug_msg or "Updated" in debug_msg or log_txt:
-             return {
-                'Ticker': ticker, 'Name': name, 'Total PnL (%)': 0.0,
-                'Trades': 0, 'Win Rate (%)': 0.0,
-                'Recent Buy': '-', 'Recent Sell': '-',
-                'Current PnL (%)': None,
-                'df_daily': df_daily, 'trades': [],
-                'DebugInfo': debug_msg
-            }
+        # Removed: elif block for debug messages (no longer needed)
     except Exception as e:
         return {
             'Ticker': ticker, 'Name': name, 'Total PnL (%)': 0.0,
             'Trades': 0, 'Win Rate (%)': 0.0,
             'Recent Buy': '-', 'Recent Sell': '-',
             'Current PnL (%)': None,
-            'df_daily': None, 'trades': [],
-            'DebugInfo': f"Error: {e}"
+            'df_daily': None, 'trades': []
         }
     return None
     return None
@@ -650,13 +694,80 @@ def get_stock_list_naver(market_type, top_n=200):
             {'Code':'005380', 'Name':'현대차'}, {'Code':'000270', 'Name':'기아'}
         ])
 
-st.title("� 208-Week High-Speed System")
+# --- 설정 저장/불러오기 ---
+import json
+import os # Added this import for os.path.exists
+
+SETTINGS_FILE = "user_settings.json"
+
+def load_settings():
+    """이전 설정값 불러오기"""
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            pass
+    # 기본값
+    return {
+        'market': 'KOSPI',
+        'lookback': 208,
+        'n_stocks': 200,
+        'bc_breakout_days': 60
+    }
+
+def save_settings(settings):
+    """현재 설정값 저장"""
+    try:
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Settings save error: {e}")
+
+st.title(" 208-Week High-Speed System")
+
 
 with st.sidebar:
     st.header("🔍 설정")
-    market_sel = st.radio("시장 선택", ["KOSPI", "KOSDAQ"])
-    lookback_sel = st.number_input("조회 기간 (주)", value=208, step=1, min_value=52)
-    n_stocks_sel = st.slider("분석할 상위 종목 수", 50, 500, 200)
+    
+    # 설정 불러오기
+    saved_settings = load_settings()
+    
+    # 시장 선택 (인덱스로 변환)
+    market_options = ["KOSPI", "KOSDAQ"]
+    market_idx = market_options.index(saved_settings.get('market', 'KOSPI'))
+    market_sel = st.radio("시장 선택", market_options, index=market_idx)
+    
+    lookback_sel = st.number_input("조회 기간 (주)", value=saved_settings.get('lookback', 208), step=1, min_value=52)
+    n_stocks_sel = st.slider("분석할 상위 종목 수", 50, 500, saved_settings.get('n_stocks', 200))
+    bc_breakout_days = st.slider(
+        "B/C 돌파 확인 기간 (일)", 
+        min_value=5, max_value=60, value=saved_settings.get('bc_breakout_days', 60), step=5,
+        help="최근 N일 내 B/C 라인 아래 있었는지 확인. 짧을수록 신선한 돌파만, 길수록 더 많은 종목 포함."
+    )
+    
+    # 설정 변경 시 자동 저장
+    current_settings = {
+        'market': market_sel,
+        'lookback': lookback_sel,
+        'n_stocks': n_stocks_sel,
+        'bc_breakout_days': bc_breakout_days
+    }
+    if current_settings != saved_settings:
+        save_settings(current_settings)
+    
+    st.divider()
+    if st.button("🗑️ 가격 캐시 초기화", help="저장된 가격 데이터를 모두 삭제하고 새로 내려받습니다."):
+        try:
+            if os.path.exists(CACHE_DB):
+                # DB 연결이 열려 있을 수 있으므로 연결 종료 시도는 못하지만, 파일 삭제 시도
+                os.remove(CACHE_DB)
+                st.success("캐시가 초기화되었습니다. 다시 스캔해 주세요.")
+                st.rerun()
+        except Exception as e:
+            st.error(f"캐시 삭제 실패: {e}")
+
+
 
 tab1, tab2 = st.tabs(["📊 실시간 스크리너", "🧪 백테스팅"])
 
@@ -740,7 +851,7 @@ with tab1:
                         scan_date_ts = pd.Timestamp(scan_date)
                         df_until_scan = df[df.index <= scan_date_ts].copy()
                         
-                        res = analyze_stock_core(stock_row['Code'], stock_row['Name'], df_until_scan, lookback_sel)
+                        res = analyze_stock_core(stock_row['Code'], stock_row['Name'], df_until_scan, lookback_sel, bc_breakout_days)
                         if res:
                             # 차트는 전체 기간 표시하도록 원본 데이터로 교체
                             res['df_daily'] = df_full_for_chart
@@ -793,10 +904,36 @@ with tab1:
         # DataFrame 생성 및 컬럼 정리
         df_disp = pd.DataFrame(st.session_state['scan_results']).drop(columns=['df_daily', 'segments', 'recent_low'], errors='ignore')
         
+        # [가독성 개선] 수익률과 상태 통합
+        if '수익률' in df_disp.columns and '상태' in df_disp.columns:
+            df_disp['수익률/상태'] = df_disp.apply(
+                lambda row: f"{'+' if row['수익률'] > 0 else ''}{row['수익률']:.1f}% ({row['상태']})" 
+                if pd.notna(row['수익률']) and pd.notna(row['상태']) else '-',
+                axis=1
+            )
+            df_disp.drop(columns=['수익률', '상태'], inplace=True)
+        
+        # [가독성 개선] Max/Min 수익률과 날짜 통합
+        if 'Max 수익률' in df_disp.columns and 'Max 날짜' in df_disp.columns:
+            df_disp['Max 수익/날짜'] = df_disp.apply(
+                lambda row: f"{'+' if row['Max 수익률'] > 0 else ''}{row['Max 수익률']:.1f}% ({row['Max 날짜']})" 
+                if pd.notna(row['Max 수익률']) and pd.notna(row['Max 날짜']) else '-',
+                axis=1
+            )
+            df_disp.drop(columns=['Max 수익률', 'Max 날짜'], inplace=True)
+        
+        if 'Min 수익률' in df_disp.columns and 'Min 날짜' in df_disp.columns:
+            df_disp['Min 수익/날짜'] = df_disp.apply(
+                lambda row: f"{'+' if row['Min 수익률'] > 0 else ''}{row['Min 수익률']:.1f}% ({row['Min 날짜']})" 
+                if pd.notna(row['Min 수익률']) and pd.notna(row['Min 날짜']) else '-',
+                axis=1
+            )
+            df_disp.drop(columns=['Min 수익률', 'Min 날짜'], inplace=True)
+        
         # 컬럼 순서 재정렬 (가독성 최적화)
         preferred_cols = [
             'Code', 'Name', '매수가', '현재가', 'B/C 라인', 'B/C 상승률', 
-            '수익률', 'Max 수익률', 'Max 날짜', 'Min 수익률', 'Min 날짜', '상태',
+            '수익률/상태', 'Max 수익/날짜', 'Min 수익/날짜',
             '208주 최저', '208주 최고', '현재 구간', '20일선'
         ]
         
@@ -814,12 +951,7 @@ with tab1:
         # 퍼센트 컬럼: 포맷팅
         if 'B/C 상승률' in df_disp.columns:
             df_disp['B/C 상승률'] = df_disp['B/C 상승률'].apply(lambda x: f"+{x:.1f}%" if x > 0 else f"{x:.1f}%")
-        if '수익률' in df_disp.columns:
-            df_disp['수익률'] = df_disp['수익률'].apply(lambda x: f"+{x:.1f}%" if x > 0 else f"{x:.1f}%")
-        if 'Max 수익률' in df_disp.columns:
-            df_disp['Max 수익률'] = df_disp['Max 수익률'].apply(lambda x: f"+{x:.1f}%" if x > 0 else f"{x:.1f}%")
-        if 'Min 수익률' in df_disp.columns:
-            df_disp['Min 수익률'] = df_disp['Min 수익률'].apply(lambda x: f"+{x:.1f}%" if x > 0 else f"{x:.1f}%")
+
         
         st.dataframe(df_disp, width='stretch')
         st.divider()
@@ -922,7 +1054,7 @@ with tab2:
     with st.expander("📅 백테스트 기간 설정", expanded=False):
         col_d1, col_d2 = st.columns(2)
         with col_d1:
-            bt_start = st.date_input("시작일", value=datetime(2020, 1, 1))
+            bt_start = st.date_input("시작일", value=datetime(2014, 1, 1))
         with col_d2:
             bt_end = st.date_input("종료일", value=datetime.now())
     
@@ -965,7 +1097,8 @@ with tab2:
             'end_date': bt_end.strftime('%Y-%m-%d'),
             'end_date': bt_end.strftime('%Y-%m-%d'),
             'force_liquidate': bt_force_liquidate,
-            'lookback': lookback_sel
+            'lookback': lookback_sel,
+            'bc_breakout_days': bc_breakout_days  # B/C 돌파 확인 기간
         }
         bt_results = []
         pb_bt = st.progress(0)
@@ -1002,35 +1135,22 @@ with tab2:
             df_summary['Recent Buy'] = pd.to_datetime(df_summary['Recent Buy'], format='%Y-%m-%d', errors='coerce')
         # [FIX] Recent Sell은 '보유중', '신규' 등 텍스트가 섞여있으므로 datetime 변환 금지 (변환 시 NaT가 되어 로직 깨짐)
         
-        # [Visualization] 스크리너 일치 여부 확인 (Core:BUY)
-        # Log 컬럼이 제거되었으므로 DebugInfo 사용 (없으면 빈 문자열)
-        df_summary['is_core_buy'] = df_summary.get('DebugInfo', pd.Series([''] * len(df_summary))).fillna('').apply(lambda x: '[Core:BUY]' in str(x) if x else False)
-        df_summary['is_new_signal'] = df_summary['Recent Sell'] == '🆕 신규'
-
-        # "보유중"인데 스크리너에도 뜬 종목 표시
-        mask_held_rescreened = (df_summary['Recent Sell'] == '보유중') & (df_summary['is_core_buy'])
-        df_summary.loc[mask_held_rescreened, 'Recent Sell'] = '✅ 보유중 (Screener)'
-
-        # [Visualization] 스크리너 검색일(Screener Date) 추가
-        # "시뮬레이션 종료일 기준으로 조건을 만족하는 종목"만 표시
-        # (과거 매수 여부와 무관하게, 현재 조건 만족 여부만 체크)
-        sim_date_str = bt_end.strftime('%Y-%m-%d')
-        df_summary['Screener Date'] = df_summary['is_core_buy'].apply(lambda x: sim_date_str if x else '-')
-
         # [Filter] 시뮬레이션 기간 내 매수 신호가 있는 종목만 표시
         # 사용자 설정 기간(bt_start ~ bt_end) 이전 매수는 무시하고, 기간 내 신호만 보여줌
         start_date_filter = pd.Timestamp(bt_start)  # Streamlit date -> pandas Timestamp 변환
         mask_recent_activity = (
             (df_summary['Recent Buy'] >= start_date_filter) |  # 기간 내 매수
-            (df_summary['Screener Date'] != '-')  # 또는 종료일 기준 스크리너 일치
+            (df_summary['Recent Sell'] == '🆕 신규')  # 또는 신규 신호
         )
         df_summary = df_summary[mask_recent_activity].copy()
 
-        # 정렬 순서: 1. 신규 매수, 2. 스크리너 일치 종목(보유중 포함), 3. 최근 매수일
+        # 정렬 순서: 1. 신규 매수, 2. 최근 매수일
+        df_summary['_is_new'] = df_summary['Recent Sell'] == '🆕 신규'
         df_summary = df_summary.sort_values(
-            by=['is_new_signal', 'is_core_buy', 'Recent Buy'], 
-            ascending=[False, False, False]
+            by=['_is_new', 'Recent Buy'], 
+            ascending=[False, False]
         )
+        df_summary.drop(columns=['_is_new'], inplace=True)
         
         # 정렬 후 인덱스 재설정
         df_summary = df_summary.reset_index(drop=True)
@@ -1038,9 +1158,39 @@ with tab2:
         # 맨 앞에 명시적인 행 번호 컬럼 추가
         df_summary.insert(0, '#', range(len(df_summary)))
         
-        # 컬럼 순서 재배치 (Current PnL 추가, Log 제거)
-        cols = ['#', 'Ticker', 'Name', 'Total PnL (%)', 'Trades', 'Win Rate (%)', 'Recent Buy', 'Screener Date', 'Recent Sell', 'Current PnL (%)']
-        # 나머지 컬럼들(is_core_buy, DebugInfo 등) 뒤에 붙이기
+        # [가독성 개선] Recent Buy 날짜 포맷 (날짜만 표시 + 가격 추가)
+        if 'Recent Buy' in df_summary.columns and 'Recent Buy Price' in df_summary.columns:
+            df_summary['Recent Buy'] = df_summary.apply(
+                lambda row: f"{row['Recent Buy'].strftime('%Y-%m-%d')} ({int(row['Recent Buy Price']):,})" 
+                if pd.notna(row['Recent Buy']) and isinstance(row['Recent Buy'], pd.Timestamp) and pd.notna(row['Recent Buy Price'])
+                else str(row['Recent Buy']),
+                axis=1
+            )
+        
+        # [가독성 개선] Recent Sell 가격 추가 (보유중/신규 포함)
+        if 'Recent Sell' in df_summary.columns and 'Recent Sell Price' in df_summary.columns:
+            df_summary['Recent Sell'] = df_summary.apply(
+                lambda row: f"{row['Recent Sell']} ({int(row['Recent Sell Price']):,})" 
+                if pd.notna(row['Recent Sell']) and pd.notna(row['Recent Sell Price'])
+                else str(row['Recent Sell']),
+                axis=1
+            )
+        
+        # [가독성 개선] 불필요한 컬럼 제거
+        cols_to_drop = ['is_core_buy', 'is_new_signal', 'DebugInfo', 'Log', 'Recent Buy Price', 'Recent Sell Price']
+        df_summary.drop(columns=cols_to_drop, errors='ignore', inplace=True)
+        
+        # [가독성 개선] 수익률 컬럼 포맷팅 (소수점 첫째자리까지)
+        pnl_cols = ['Total PnL (%)', 'Win Rate (%)', 'Current PnL (%)']
+        for col in pnl_cols:
+            if col in df_summary.columns:
+                df_summary[col] = df_summary[col].apply(
+                    lambda x: f"{x:.1f}" if pd.notna(x) else '-'
+                )
+        
+        # 컬럼 순서 재배치 (Current PnL을 Name 옆으로)
+        cols = ['#', 'Ticker', 'Name', 'Current PnL (%)', 'Total PnL (%)', 'Trades', 'Win Rate (%)', 'Recent Buy', 'Recent Sell']
+        # 나머지 컬럼들 뒤에 붙이기
         existing_cols = df_summary.columns.tolist()
         final_cols = [c for c in cols if c in existing_cols] + [c for c in existing_cols if c not in cols]
         df_summary = df_summary[final_cols]
@@ -1054,7 +1204,7 @@ with tab2:
         st.caption("💡 **종목 선택:** 아래에서 종목명을 검색하거나 선택하세요.")
         
         # 종목명 리스트 생성 (테이블 순서와 동일)
-        stock_options = [f"#{row['#']} - {row['Name']} (Ticker: {row['Ticker']}, PnL: {row['Total PnL (%)']:.2f}%)" 
+        stock_options = [f"#{row['#']} - {row['Name']} (Ticker: {row['Ticker']}, PnL: {row['Total PnL (%)']}%)" 
                         for _, row in df_summary.iterrows()]
         
         # 기본값: 이전 선택 유지
@@ -1158,4 +1308,11 @@ with tab2:
             st.plotly_chart(fig, width='stretch')
             
         st.write("📋 매매 기록 테이블")
-        st.table(pd.DataFrame(row_bt['trades']).drop(columns=['segments']))
+        if row_bt['trades']:
+            df_trades = pd.DataFrame(row_bt['trades'])
+            # segments 컬럼이 있으면 제거
+            if 'segments' in df_trades.columns:
+                df_trades = df_trades.drop(columns=['segments'])
+            st.table(df_trades)
+        else:
+            st.info("매매 기록이 없습니다.")
