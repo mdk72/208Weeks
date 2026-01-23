@@ -279,7 +279,8 @@ with tab1:
                 c4.caption(f"Min: {row_sel['Min 수익률']:+.1f}% ({row_sel['Min 날짜']})")
             
             st.markdown("#### 차트 분석")
-            df_chart = row_sel['df_daily']
+            df_chart = row_sel['df_daily'].copy()
+            df_chart['MA20'] = df_chart['Close'].rolling(window=20).mean()
             
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['Close'], name='가격', line=dict(color='#26a69a', width=2)))
