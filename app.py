@@ -414,11 +414,34 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
         
         df_daily = df_daily.copy()
         df_daily['MA20'] = df_daily['Close'].rolling(window=20).mean()
-        # 1456일 롤링으로 208주 고저가 근사 (벡터화 속도 개선)
-        # 주봉 리샘플링은 너무 느려서 실용적이지 않음 (10-15분)
-        # 1456일 롤링은 빠르고(1-2분) 대부분의 경우 충분히 정확함
-        df_daily['RollLow'] = df_daily['Low'].rolling(window=1456).min()
-        df_daily['RollHigh'] = df_daily['High'].rolling(window=1456).max()
+        
+        # [FIX] 스크리너와 동일한 208주 계산 방식 사용
+        # 주봉으로 변환 후 rolling (정확하면서도 빠름)
+        df_weekly = df_daily.resample('W').agg({
+            'Open': 'first', 
+            'High': 'max', 
+            'Low': 'min', 
+            'Close': 'last'
+        })
+        
+        # 주봉 기준 208주 rolling
+        df_weekly['Low208'] = df_weekly['Low'].rolling(window=208, min_periods=208).min()
+        df_weekly['High208'] = df_weekly['High'].rolling(window=208, min_periods=208).max()
+        
+        # Daily 데이터에 주봉 208주 고저가 매핑 (forward fill)
+        # 각 일별 데이터에 해당 주의 208주 고저가 할당
+        df_daily['Week'] = df_daily.index.to_period('W')
+        df_weekly['Week'] = df_weekly.index.to_period('W')
+        
+        # 주봉 데이터를 일별로 매핑
+        weekly_map = df_weekly[['Week', 'Low208', 'High208']].set_index('Week')
+        df_daily = df_daily.join(weekly_map, on='Week')
+        
+        # Week 컬럼 제거
+        df_daily = df_daily.drop(columns=['Week'])
+        
+        # 컬럼명 변경 (기존 코드 호환)
+        df_daily = df_daily.rename(columns={'Low208': 'RollLow', 'High208': 'RollHigh'})
         
         trades = []
         position = None
@@ -671,14 +694,54 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
             else:
                 last_sell = trades[-1]['exit_date'].strftime('%Y-%m-%d')
             
+            
+            # [FIX] Max/Min 수익률 계산 (보유 기간 동안만)
+            # 최근 매수의 entry_price 기준으로 보유 기간 동안의 가격 변화 추적
+            recent_entry_date = last_trade['entry_date']
+            recent_entry_price = last_trade['entry_price']
+            recent_exit_date = last_trade['exit_date']  # None이면 보유중
+            
+            # 보유 기간의 데이터만 사용
+            df_after_entry = df_daily[df_daily.index >= recent_entry_date]
+            
+            # 매도한 경우, 매도일까지만
+            if pd.notna(recent_exit_date):
+                df_after_entry = df_after_entry[df_after_entry.index <= recent_exit_date]
+            
+            if len(df_after_entry) > 0:
+                # 각 날짜별 수익률 계산
+                df_after_entry_copy = df_after_entry.copy()
+                df_after_entry_copy['pnl_pct'] = (df_after_entry_copy['Close'] / recent_entry_price - 1) * 100
+                
+                # Max 수익률
+                max_pnl = df_after_entry_copy['pnl_pct'].max()
+                max_pnl_date = df_after_entry_copy['pnl_pct'].idxmax().strftime('%Y-%m-%d')
+                
+                # Min 수익률
+                min_pnl = df_after_entry_copy['pnl_pct'].min()
+                min_pnl_date = df_after_entry_copy['pnl_pct'].idxmin().strftime('%Y-%m-%d')
+            else:
+                max_pnl = 0.0
+                max_pnl_date = recent_entry_date.strftime('%Y-%m-%d')
+                min_pnl = 0.0
+                min_pnl_date = recent_entry_date.strftime('%Y-%m-%d')
+            
+            
             return {
-                'Ticker': ticker, 'Name': name, 'Total PnL (%)': sum(t['pnl'] for t in trades),
-                'Trades': len(trades), 'Win Rate (%)': (len([t for t in trades if t['pnl'] > 0]) / len(trades)) * 100,
-                'Recent Buy': last_buy, 
+                'Ticker': ticker, 'Name': name, 
                 'Recent Buy Price': last_trade['entry_price'],
-                'Recent Sell': last_sell,
                 'Recent Sell Price': last_trade['exit_price'],
-                'Current PnL (%)': current_pnl,  # 현재 수익률 추가
+                'Current PnL (%)': current_pnl,
+                'Max 수익률': max_pnl,
+                'Max 날짜': max_pnl_date,
+                'Min 수익률': min_pnl,
+                'Min 날짜': min_pnl_date,
+                'Total PnL (%)': sum(t['pnl'] for t in trades),
+                'Trades': len(trades), 
+                'Win Rate (%)': (len([t for t in trades if t['pnl'] > 0]) / len(trades)) * 100,
+                'Recent Buy': last_buy, 
+                'Recent Sell': last_sell,
+                'Duration': last_trade['duration'],  # 보유일 추가
                 'df_daily': df_daily, 'trades': trades
             }
         # Removed: elif block for debug messages (no longer needed)
@@ -1153,20 +1216,20 @@ with tab2:
             
             if scan_market == market_sel:
                 existing_codes = set(stock_list['Code'].values)
-            new_rows = []
-            
-            for res in st.session_state['scan_results']:
-                if res['Code'] not in existing_codes:
-                    # 스크리너 데이터에서 현재가 추출 시도
-                    last_price = 0
-                    if 'df_daily' in res and len(res['df_daily']) > 0:
-                         last_price = res['df_daily']['Close'].iloc[-1]
-                    
-                    new_rows.append({'Code': res['Code'], 'Name': res['Name'], '현재가': last_price})
-            
-            if new_rows:
-                stock_list = pd.concat([stock_list, pd.DataFrame(new_rows)], ignore_index=True)
-                st.toast(f"💡 스크리너 발견 종목 {len(new_rows)}개를 백테스트 목록에 자동 추가했습니다!")
+                new_rows = []
+                
+                for res in st.session_state['scan_results']:
+                    if res['Code'] not in existing_codes:
+                        # 스크리너 데이터에서 현재가 추출 시도
+                        last_price = 0
+                        if 'df_daily' in res and len(res['df_daily']) > 0:
+                             last_price = res['df_daily']['Close'].iloc[-1]
+                        
+                        new_rows.append({'Code': res['Code'], 'Name': res['Name'], '현재가': last_price})
+                
+                if new_rows:
+                    stock_list = pd.concat([stock_list, pd.DataFrame(new_rows)], ignore_index=True)
+                    st.toast(f"💡 스크리너 발견 종목 {len(new_rows)}개를 백테스트 목록에 자동 추가했습니다!")
         cfg = {
             'buy_breakout':bt_brk, 'buy_ma20':bt_ma, 'buy_segment':bt_seg, 
             'exit_target':bt_tgt, 'exit_method':bt_met, 'stop_loss_pct':bt_sl,
@@ -1265,6 +1328,23 @@ with tab2:
         cols_to_drop = ['is_core_buy', 'is_new_signal', 'DebugInfo', 'Log', 'Recent Buy Price', 'Recent Sell Price']
         df_summary.drop(columns=cols_to_drop, errors='ignore', inplace=True)
         
+        # [NEW] Max/Min 수익 포맷팅
+        if 'Max 수익률' in df_summary.columns and 'Max 날짜' in df_summary.columns:
+            df_summary['Max 수익/날짜'] = df_summary.apply(
+                lambda row: f"+{row['Max 수익률']:.1f}% ({row['Max 날짜']})" 
+                if pd.notna(row['Max 수익률']) and row['Max 수익률'] >= 0
+                else f"{row['Max 수익률']:.1f}% ({row['Max 날짜']})",
+                axis=1
+            )
+        
+        if 'Min 수익률' in df_summary.columns and 'Min 날짜' in df_summary.columns:
+            df_summary['Min 수익/날짜'] = df_summary.apply(
+                lambda row: f"{row['Min 수익률']:.1f}% ({row['Min 날짜']})" 
+                if pd.notna(row['Min 수익률'])
+                else '-',
+                axis=1
+            )
+        
         # [가독성 개선] 수익률 컬럼 포맷팅 (소수점 첫째자리까지)
         pnl_cols = ['Total PnL (%)', 'Win Rate (%)', 'Current PnL (%)']
         for col in pnl_cols:
@@ -1273,20 +1353,54 @@ with tab2:
                     lambda x: f"{x:.1f}" if pd.notna(x) else '-'
                 )
         
-        # 컬럼 순서 재배치 (Current PnL을 Name 옆으로)
-        cols = ['#', 'Ticker', 'Name', 'Current PnL (%)', 'Total PnL (%)', 'Trades', 'Win Rate (%)', 'Recent Buy', 'Recent Sell']
-        # 나머지 컬럼들 뒤에 붙이기
-        existing_cols = df_summary.columns.tolist()
-        final_cols = [c for c in cols if c in existing_cols] + [c for c in existing_cols if c not in cols]
-        df_summary = df_summary[final_cols]
+        # [NEW] 컬럼 순서 재배치 (스크리너와 일치)
+        # # | Code | Name | 매수가 | 현재가 | Current PnL | Max 수익/날짜 | Min 수익/날짜 | Total PnL | Trades | Win Rate | 보유일 | Recent Buy | Recent Sell
+        cols = [
+            '#', 'Ticker', 'Name', 
+            'Recent Buy Price', 'Recent Sell Price',  # 매수가, 현재가
+            'Current PnL (%)', 
+            'Max 수익/날짜', 'Min 수익/날짜',
+            'Total PnL (%)', 'Trades', 'Win Rate (%)', 
+            'Duration',  # 보유일
+            'Recent Buy', 'Recent Sell'
+        ]
         
-        # 테이블 표시 (정렬 가능, DataFrame 인덱스는 숨김)
-        st.dataframe(df_summary, width='stretch', hide_index=True)
+        # 컬럼명 변경 (가독성)
+        df_summary_display = df_summary.copy()
+        df_summary_display = df_summary_display.rename(columns={
+            'Ticker': 'Code',
+            'Recent Buy Price': '매수가',
+            'Recent Sell Price': '현재가',
+            'Duration': '보유일'
+        })
+        
+        # 나머지 컬럼들 뒤에 붙이기
+        existing_cols = df_summary_display.columns.tolist()
+        renamed_cols = [c if c not in ['Ticker', 'Recent Buy Price', 'Recent Sell Price'] else 
+                       ('Code' if c == 'Ticker' else ('매수가' if c == 'Recent Buy Price' else '현재가'))
+                       for c in cols]
+        final_cols = [c for c in renamed_cols if c in existing_cols] + [c for c in existing_cols if c not in renamed_cols and c not in ['Max 수익률', 'Max 날짜', 'Min 수익률', 'Min 날짜']]
+        df_summary_display = df_summary_display[final_cols]
+        
+        # 가격 포맷팅
+        if '매수가' in df_summary_display.columns:
+            df_summary_display['매수가'] = df_summary_display['매수가'].apply(
+                lambda x: f"{int(x):,}" if pd.notna(x) else '-'
+            )
+        if '현재가' in df_summary_display.columns:
+            df_summary_display['현재가'] = df_summary_display['현재가'].apply(
+                lambda x: f"{int(x):,}" if pd.notna(x) else '-'
+            )
+        
+        # 요약 테이블 표시
+        st.dataframe(df_summary_display, width='stretch', hide_index=True)
+        
         
         st.divider()
+        st.subheader("📈 종목 상세 차트 및 매매 이력")
         
         # 종목명 검색으로 선택 (개선된 UX)
-        st.caption("💡 **종목 선택:** 아래에서 종목명을 검색하거나 선택하세요.")
+        st.caption("💡 **종목 선택:** 아래에서 종목명을 검색하거나 선택하여 가격 차트와 매매 이력을 확인하세요.")
         
         # 종목명 리스트 생성 (테이블 순서와 동일)
         stock_options = [f"#{row['#']} - {row['Name']} (Ticker: {row['Ticker']}, PnL: {row['Total PnL (%)']}%)" 
@@ -1399,9 +1513,111 @@ with tab2:
         st.write("📋 매매 기록 테이블")
         if row_bt['trades']:
             df_trades = pd.DataFrame(row_bt['trades'])
-            # segments 컬럼이 있으면 제거
-            if 'segments' in df_trades.columns:
-                df_trades = df_trades.drop(columns=['segments'])
-            st.table(df_trades)
+            df_daily_data = row_bt['df_daily']
+            
+            # [NEW] 각 거래별 Max/Min 수익률 계산
+            max_pnls = []
+            max_dates = []
+            min_pnls = []
+            min_dates = []
+            
+            for _, trade in df_trades.iterrows():
+                entry_date = trade['entry_date']
+                entry_price = trade['entry_price']
+                exit_date = trade['exit_date']
+                
+                # 보유 기간의 데이터
+                df_period = df_daily_data[df_daily_data.index >= entry_date]
+                if pd.notna(exit_date):
+                    df_period = df_period[df_period.index <= exit_date]
+                
+                if len(df_period) > 0:
+                    df_period_copy = df_period.copy()
+                    df_period_copy['pnl_pct'] = (df_period_copy['Close'] / entry_price - 1) * 100
+                    
+                    max_pnl = df_period_copy['pnl_pct'].max()
+                    max_date = df_period_copy['pnl_pct'].idxmax()
+                    min_pnl = df_period_copy['pnl_pct'].min()
+                    min_date = df_period_copy['pnl_pct'].idxmin()
+                else:
+                    max_pnl = 0.0
+                    max_date = entry_date
+                    min_pnl = 0.0
+                    min_date = entry_date
+                
+                max_pnls.append(max_pnl)
+                max_dates.append(max_date)
+                min_pnls.append(min_pnl)
+                min_dates.append(min_date)
+            
+            df_trades['Max 수익률'] = max_pnls
+            df_trades['Max 날짜'] = max_dates
+            df_trades['Min 수익률'] = min_pnls
+            df_trades['Min 날짜'] = min_dates
+            
+            # 불필요한 컬럼 제거
+            df_trades = df_trades.drop(columns=['segments', 'is_new_signal'], errors='ignore')
+            
+            # 날짜 포맷팅
+            if 'entry_date' in df_trades.columns:
+                df_trades['entry_date'] = pd.to_datetime(df_trades['entry_date']).dt.strftime('%Y-%m-%d')
+            if 'exit_date' in df_trades.columns:
+                df_trades['exit_date'] = df_trades['exit_date'].apply(
+                    lambda x: pd.to_datetime(x).strftime('%Y-%m-%d') if pd.notna(x) else '보유중'
+                )
+            if 'Max 날짜' in df_trades.columns:
+                df_trades['Max 날짜'] = pd.to_datetime(df_trades['Max 날짜']).dt.strftime('%Y-%m-%d')
+            if 'Min 날짜' in df_trades.columns:
+                df_trades['Min 날짜'] = pd.to_datetime(df_trades['Min 날짜']).dt.strftime('%Y-%m-%d')
+            
+            # 가격 포맷팅 (천단위 쉼표)
+            if 'entry_price' in df_trades.columns:
+                df_trades['entry_price'] = df_trades['entry_price'].apply(
+                    lambda x: f"{int(x):,}" if pd.notna(x) else '-'
+                )
+            if 'exit_price' in df_trades.columns:
+                df_trades['exit_price'] = df_trades['exit_price'].apply(
+                    lambda x: f"{int(x):,}" if pd.notna(x) else '-'
+                )
+            
+            # 수익률 포맷팅
+            if 'pnl' in df_trades.columns:
+                df_trades['pnl'] = df_trades['pnl'].apply(
+                    lambda x: f"{x:+.1f}%" if pd.notna(x) else '-'
+                )
+            
+            # Max/Min 수익/날짜 결합
+            if 'Max 수익률' in df_trades.columns and 'Max 날짜' in df_trades.columns:
+                df_trades['Max 수익/날짜'] = df_trades.apply(
+                    lambda row: f"+{row['Max 수익률']:.1f}% ({row['Max 날짜']})" 
+                    if pd.notna(row['Max 수익률']) and row['Max 수익률'] >= 0
+                    else f"{row['Max 수익률']:.1f}% ({row['Max 날짜']})",
+                    axis=1
+                )
+            
+            if 'Min 수익률' in df_trades.columns and 'Min 날짜' in df_trades.columns:
+                df_trades['Min 수익/날짜'] = df_trades.apply(
+                    lambda row: f"{row['Min 수익률']:.1f}% ({row['Min 날짜']})",
+                    axis=1
+                )
+            
+            # 불필요한 중간 컬럼 제거
+            df_trades = df_trades.drop(columns=['Max 수익률', 'Max 날짜', 'Min 수익률', 'Min 날짜'], errors='ignore')
+            
+            # 컬럼명 한글화
+            df_trades = df_trades.rename(columns={
+                'entry_date': '매수일',
+                'entry_price': '매수가',
+                'exit_date': '매도일',
+                'exit_price': '매도가',
+                'pnl': '수익률',
+                'duration': '보유일'
+            })
+            
+            # 인덱스 추가 (#)
+            df_trades.insert(0, '#', range(len(df_trades)))
+            
+            # DataFrame으로 표시 (정렬 가능, 인덱스 숨김)
+            st.dataframe(df_trades, width='stretch', hide_index=True)
         else:
             st.info("매매 기록이 없습니다.")
