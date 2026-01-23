@@ -13,7 +13,7 @@ import threading
 import traceback
 
 # --- 상수 및 초기 설정 ---
-CACHE_DB = "price_cache.db"
+CACHE_DB = os.path.join(os.path.dirname(__file__), "price_cache.db")  # 절대 경로
 db_lock = threading.Lock()
 
 def init_db():
@@ -42,112 +42,163 @@ def init_db():
         conn.commit()
         conn.close()
 
-def get_cached_data(ticker, requested_start_date):
-    if not os.path.exists(CACHE_DB): return None
+def get_cached_data(ticker, requested_start_date, scan_date=None):
+    """
+    캐시에서 데이터 조회 (스마트 검증 포함)
+    
+    Args:
+        ticker: 종목 코드
+        requested_start_date: 요청 시작 날짜 (str, 'YYYY-MM-DD')
+        scan_date: 스크리닝 기준 날짜 (date object, optional)
+                   - None이면 검증 안함 (과거와의 호환성)
+                   - 제공되면 캐시가 이 날짜까지 커버하는지 검사
+    
+    Returns:
+        DataFrame or None
+    """
+    if not os.path.exists(CACHE_DB):
+        return None
     try:
         with db_lock:
-            conn = sqlite3.connect(CACHE_DB)
+            conn = sqlite3.connect(CACHE_DB, timeout=60)
             cursor = conn.cursor()
             
-            # [HOTFIX] Check the earliest date cached for this ticker
-            cursor.execute("SELECT MIN(date) FROM price_data WHERE ticker = ?", (ticker,))
-            min_date_row = cursor.fetchone()
-            
-            if min_date_row and min_date_row[0]:
-                cached_min_date_str = min_date_row[0]
-                cached_min_date = datetime.strptime(cached_min_date_str, '%Y-%m-%d').date()
-                requested_start_date_obj = datetime.strptime(requested_start_date, '%Y-%m-%d').date()
-                
-                # [FIX] Allow 7-day grace period for holidays/weekends
-                # If cached data starts more than 7 days AFTER requested, we need more history
-                if cached_min_date > (requested_start_date_obj + timedelta(days=7)):
-                    conn.close()
-                    return None
-
-            cursor.execute("SELECT last_updated FROM cache_meta WHERE ticker = ?", (ticker,))
-            row = cursor.fetchone()
-            
-            today_str = datetime.now().strftime('%Y-%m-%d')
-            if row and row[0] == today_str:
-                df = pd.read_sql_query("SELECT * FROM price_data WHERE ticker = ? AND date >= ?", conn, params=(ticker, requested_start_date))
-                conn.close()
-                if not df.empty:
-                    df['date'] = pd.to_datetime(df['date'])
-                    
-                    # [NEW] Data completeness check
-                    last_data_date = df['date'].max()
-                    current_time = datetime.now()
-                    
-                    # If after market close (15:30), today's data should exist
-                    market_close = current_time.replace(hour=15, minute=30, second=0, microsecond=0)
-                    
-                    if current_time > market_close:
-                        # Check if today's data exists
-                        today_date = pd.Timestamp(today_str)
-                        if last_data_date < today_date:
-                            # [FIX] Instead of just returning None (which might hit cache again), 
-                            # we should probably continue to fetch_data to update it.
-                            return None  # Invalidate cache
-                    
-                    df.set_index('date', inplace=True)
-                    df.columns = [c.capitalize() for c in df.columns]
-                    return df
+            # 데이터 조회
+            df = pd.read_sql_query(
+                "SELECT * FROM price_data WHERE ticker = ? AND date >= ?", 
+                conn, 
+                params=(ticker, requested_start_date)
+            )
             conn.close()
+            
+            if not df.empty:
+                df['date'] = pd.to_datetime(df['date'])
+                
+                # [NEW] 스마트 검증: scan_date가 제공되면 최신성 체크
+                if scan_date is not None:
+                    last_cached_date = df['date'].max().date()
+                    
+                    # 캐시가 scan_date보다 오래되었으면 무효화
+                    if last_cached_date < scan_date:
+                        return None  # 새로 가져오기
+                
+                df.set_index('date', inplace=True)
+                df.columns = [c.capitalize() for c in df.columns]
+                return df
+                
     except Exception as e:
         print(f"Cache Read Error ({ticker}): {e}")
     return None
 
 def save_to_cache(ticker, df):
-    if df is None or df.empty: return
+    if df is None or df.empty:
+        return
     try:
         df_to_save = df.reset_index()
-        target_cols = ['Open', 'High', 'Low', 'Close']
         
         # 컬럼 인덱스 찾기
         date_col = 'Date' if 'Date' in df_to_save.columns else ('date' if 'date' in df_to_save.columns else ('index' if 'index' in df_to_save.columns else None))
-        if date_col is None: return
+        if date_col is None:
+            return
 
         today_str = datetime.now().strftime('%Y-%m-%d')
         
         with db_lock:
-            conn = sqlite3.connect(CACHE_DB)
-            for _, row in df_to_save.iterrows():
-                try:
+            # [FIX] timeout 추가
+            conn = sqlite3.connect(CACHE_DB, timeout=60)
+            
+            # [OPTIMIZATION] executemany 사용 및 트랜잭션 처리
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                data_to_insert = []
+                for _, row in df_to_save.iterrows():
                     d = row[date_col]
                     date_str = d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d)[:10]
-                    conn.execute("INSERT OR REPLACE INTO price_data (ticker, date, open, high, low, close) VALUES (?, ?, ?, ?, ?, ?)",
-                                 (ticker, date_str, float(row['Open']), float(row['High']), float(row['Low']), float(row['Close'])))
-                except: continue
-            
-            conn.execute("INSERT OR REPLACE INTO cache_meta (ticker, last_updated) VALUES (?, ?)", (ticker, today_str))
-            conn.commit()
-            conn.close()
+                    
+                    # [FIX] yfinance 데이터가 Series로 오는 경우 처리 (float 변환 에러 수정)
+                    def get_scalar(val):
+                        if isinstance(val, pd.Series):
+                            return float(val.iloc[0])
+                        return float(val)
+                    
+                    data_to_insert.append((
+                        ticker, 
+                        date_str, 
+                        get_scalar(row['Open']), 
+                        get_scalar(row['High']), 
+                        get_scalar(row['Low']), 
+                        get_scalar(row['Close'])
+                    ))
+                
+                conn.executemany("INSERT OR REPLACE INTO price_data (ticker, date, open, high, low, close) VALUES (?, ?, ?, ?, ?, ?)", data_to_insert)
+                conn.execute("INSERT OR REPLACE INTO cache_meta (ticker, last_updated) VALUES (?, ?)", (ticker, today_str))
+                conn.commit()
+            except Exception as write_ex:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
     except Exception as e:
         print(f"Cache Write Error ({ticker}): {e}")
 
 import time
 import random
 
-def fetch_data(ticker, market, start_date="2010-01-01"):
-    # Rate Limit 방지: 랜덤 딜레이 (0.2~0.4초)
-    time.sleep(random.uniform(0.2, 0.4))
+def fetch_data(ticker, market, start_date="2010-01-01", scan_date=None):
+    """
+    주가 데이터 가져오기 (캐시 우선, 없으면 pykrx에서)
     
-    yf_ticker = ticker + (".KS" if market == "KOSPI" else ".KQ")
-    cached_df = get_cached_data(ticker, start_date)
+    Args:
+        ticker: 종목 코드
+        market: 시장 (사용 안함, 호환성 유지)
+        start_date: 시작 날짜 (str, 'YYYY-MM-DD')
+        scan_date: 스크리닝 기준 날짜 (date object, optional)
+    
+    Returns:
+        (DataFrame, from_cache: bool) or (None, False)
+    """
+    # 캐시 확인 (scan_date 전달)
+    cached_df = get_cached_data(ticker, start_date, scan_date=scan_date)
     if cached_df is not None:
         return cached_df, True  # (데이터, 캐시_사용_여부)
     
+    # [NEW] pykrx 사용 (한국거래소 공식 데이터 - 안정적)
     try:
-        # yfinance 호출 실패 시 재시도 로직 없이 바로 실패 처리 (쓰로틀링 우선)
-        # threads=False로 설정하여 내부 스레딩 비활성화 (외부 ThreadPoolExecutor 충돌 방지)
-        df = yf.download(yf_ticker, start=start_date, progress=False, timeout=10, threads=False, auto_adjust=False)
-        if df.empty: return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        from pykrx import stock
+        
+        # 종료일: 오늘
+        end_date = datetime.now().strftime('%Y%m%d')
+        start_date_pykrx = datetime.strptime(start_date, '%Y-%m-%d').strftime('%Y%m%d')
+        
+        # pykrx로 데이터 가져오기
+        df = stock.get_market_ohlcv_by_date(start_date_pykrx, end_date, ticker)
+        
+        if df.empty:
+            return None, False
+        
+        # 컬럼명 통일 (pykrx: 시가, 고가, 저가, 종가 -> Open, High, Low, Close)
+        df = df.rename(columns={
+            '시가': 'Open',
+            '고가': 'High', 
+            '저가': 'Low',
+            '종가': 'Close',
+            '거래량': 'Volume'
+        })
+        
+        # 인덱스를 DatetimeIndex로 변환 (pykrx는 문자열 인덱스)
+        df.index = pd.to_datetime(df.index)
+        # [FIX] 인덱스 이름을 'Date'로 설정 (save_to_cache와 일치시키기 위해)
+        df.index.name = 'Date'
+        
+        # 데이터 유효성 검사
+        if len(df) < 10:
+            return None, False
+
         save_to_cache(ticker, df)
-        return df, False  # (데이터, 캐시_사용_여부)
+        return df, False
+        
     except Exception as e:
-        # print(f"Fetch Error ({ticker}): {e}") # 로그 과다 방지
+        # pykrx 실패 시 None 반환 (더 이상 yfinance 사용 안 함)
         return None, False
 
 
@@ -294,12 +345,12 @@ def analyze_stock_core(ticker, name, df, lookback_weeks=208, bc_breakout_days=60
     except:
         return None
 
-def process_backtest_stock(ticker, name, market, config, current_row=None, pre_fetched_df=None):
+def process_backtest_stock(ticker, name, market, config, current_row=None, pre_fetched_df=None, scan_date=None):
     try:
         if pre_fetched_df is not None:
             df_daily = pre_fetched_df.copy()
         else:
-            result = fetch_data(ticker, market)
+            result = fetch_data(ticker, market, scan_date=scan_date)
             if result is None:
                 df_daily = None
             else:
@@ -363,11 +414,11 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
         
         df_daily = df_daily.copy()
         df_daily['MA20'] = df_daily['Close'].rolling(window=20).mean()
-        # 1040일 롤링으로 208주 고저가 근사 (벡터화 속도 개선)
-        # [Sync] 스크리너와 동일하게 오늘 데이터 포함 (shift 제거)
-        # 스크리너는 df_weekly.tail(208) (오늘 포함)을 사용하므로, 백테스트도 shift 없이 오늘 포함해야 함.
-        df_daily['RollLow'] = df_daily['Low'].rolling(window=1040).min()
-        df_daily['RollHigh'] = df_daily['High'].rolling(window=1040).max()
+        # 1456일 롤링으로 208주 고저가 근사 (벡터화 속도 개선)
+        # 주봉 리샘플링은 너무 느려서 실용적이지 않음 (10-15분)
+        # 1456일 롤링은 빠르고(1-2분) 대부분의 경우 충분히 정확함
+        df_daily['RollLow'] = df_daily['Low'].rolling(window=1456).min()
+        df_daily['RollHigh'] = df_daily['High'].rolling(window=1456).max()
         
         trades = []
         position = None
@@ -401,10 +452,17 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                     
                 if is_buy and buy_breakout:
                     bnd = bounds[2] if buy_segment == "Segment C (B/C~C/D)" else bounds[1]
-                    # [FIX] 스크리너와 동기화: config의 bc_breakout_days 사용
+                    # [FIX] 스크리너와 동기화: config의 bc_breakout_days 사용 + Low 컬럼 사용
                     bc_days = config.get('bc_breakout_days', 60)
-                    was_below = float(df_test['Close'].iloc[max(0, i-bc_days):i].min()) <= bnd
+                    was_below = float(df_test['Low'].iloc[max(0, i-bc_days):i].min()) <= bnd
                     if not was_below: is_buy = False
+                
+                # [NEW] B/C 라인 5% 제한 (스크리너와 동기화)
+                if is_buy and buy_segment == "Segment C (B/C~C/D)":
+                    bc_line = bounds[2]
+                    max_rise_from_bc = 0.05  # 5% 제한
+                    if curr_price > bc_line * (1 + max_rise_from_bc):
+                        is_buy = False
                     
                 if is_buy and buy_ma20 and curr_price < ma20: is_buy = False
                     
@@ -458,7 +516,7 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                 })
         
         
-        # 디버깅: 종료일 기준 매수 조건 체크 (모든 종목에 대해 로그 남김)
+        # 디버깅: 종료일 기준 매수 조건 체크
         if len(df_test) > 0:
             last_idx = len(df_test) - 1
             low_208 = df_test['RollLow'].iloc[last_idx]
@@ -466,43 +524,47 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
             curr_price = float(df_test['Close'].iloc[last_idx])
             ma20 = float(df_test['MA20'].iloc[last_idx])
             
-            # 로그 데이터 강화 (Data Proof)
             log_txt += f"Chk:{df_test.index[-1].date()} C:{curr_price} H:{high_208:.0f} L:{low_208:.0f}"
             
-            if not pd.isna(low_208):
-                 step = (high_208 - low_208) / 6
-                 bounds = [low_208 + j*step for j in range(7)]
-                 
-                 is_buy = True
-                 if buy_segment == "Segment B (A/B~B/C)":
-                     if not (bounds[1] < curr_price <= bounds[2]): is_buy = False
-                 else: 
-                     if not (bounds[2] < curr_price <= bounds[3]): is_buy = False
-                 log_txt += f" Seg:{is_buy}"
-                 
-                 if is_buy and buy_breakout:
+            if not pd.isna(low_208) and (high_208 - low_208) > 0:
+                step = (high_208 - low_208) / 6
+                bounds = [low_208 + j*step for j in range(7)]
+                
+                is_buy = True
+                if buy_segment == "Segment B (A/B~B/C)":
+                    if not (bounds[1] < curr_price <= bounds[2]): is_buy = False
+                else: 
+                    if not (bounds[2] < curr_price <= bounds[3]): is_buy = False
+                log_txt += f" Seg:{is_buy}"
+                
+                if is_buy and buy_breakout:
                     bnd = bounds[2] if buy_segment == "Segment C (B/C~C/D)" else bounds[1]
-                    # [Sync] 스크리너(12주)와 로직 일치: 5일 -> 60일, Close -> Low
-                    check_start = max(0, last_idx-60)
+                    check_start = max(0, last_idx-bc_days)
                     was_below = float(df_test['Low'].iloc[check_start:last_idx].min()) <= bnd if last_idx > 0 else False
                     if not was_below: is_buy = False
-                    log_txt += f"Brk:{was_below}"
-                 
-                 if is_buy and buy_ma20 and curr_price < ma20: 
-                     is_buy = False
-                     log_txt += f" MA20:False"
-                 
-                 if is_buy: log_txt += " -> BUY!"
-                 else: log_txt += " -> NO"
-                 if position is not None: log_txt += "(Held)"
+                    log_txt += f" Brk:{was_below}"
+                
+                if is_buy and buy_segment == "Segment C (B/C~C/D)":
+                    bc_line = bounds[2]
+                    if curr_price > bc_line * 1.05:
+                        is_buy = False
+                        log_txt += " BC5%:False"
+                
+                if is_buy and buy_ma20 and curr_price < ma20: 
+                    is_buy = False
+                    log_txt += f" MA20:False"
+                
+                if is_buy: log_txt += " -> BUY!"
+                else: log_txt += " -> NO"
+                if position is not None: log_txt += "(Held)"
 
-        # 종료일 기준 신규 매수 신호 체크 (position이 None인 경우에만 실제 매수 처리)
+        # 종료일 기준 신규 매수 신호 체크
         if position is None and len(df_test) > 0:
             last_idx = len(df_test) - 1
             low_208 = df_test['RollLow'].iloc[last_idx]
             high_208 = df_test['RollHigh'].iloc[last_idx]
             
-            if not pd.isna(low_208):
+            if not pd.isna(low_208) and (high_208 - low_208) > 0:
                 curr_date = df_test.index[last_idx]
                 curr_price = float(df_test['Close'].iloc[last_idx])
                 ma20 = float(df_test['MA20'].iloc[last_idx])
@@ -518,10 +580,14 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                 
                 if is_buy and buy_breakout:
                     bnd = bounds[2] if buy_segment == "Segment C (B/C~C/D)" else bounds[1]
-                    # [FIX] 여기도 60일로 수정해야 실제 매수가 됨
-                    check_start = max(0, last_idx-60)
+                    check_start = max(0, last_idx-bc_days)
                     was_below = float(df_test['Low'].iloc[check_start:last_idx].min()) <= bnd if last_idx > 0 else False
                     if not was_below: is_buy = False
+                
+                if is_buy and buy_segment == "Segment C (B/C~C/D)":
+                    bc_line = bounds[2]
+                    if curr_price > bc_line * 1.05:
+                        is_buy = False
                     
                 if is_buy and buy_ma20 and curr_price < ma20: 
                     is_buy = False
@@ -543,6 +609,7 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
         # "시뮬레이션 종료일" 기준으로 스크리너와 동일한 함수를 직접 호출하여 확인
         try:
             lookback = config.get('lookback', 208)
+            bc_breakout_days = config.get('bc_breakout_days', 60)  # [FIX] 사용자 설정값 가져오기
             end_date_ts = pd.Timestamp(config.get('end_date'))
             
             # [CRITICAL FIX] df_test가 아닌 df_daily 전체를 end_date까지 필터링해서 사용
@@ -550,7 +617,7 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
             # 스크리너는 전체 히스토리를 사용하므로, 백테스트도 동일하게 충분한 히스토리 제공 필요
             df_for_core = df_daily[df_daily.index <= end_date_ts]
             
-            core_res = analyze_stock_core(ticker, name, df_for_core, lookback)
+            core_res = analyze_stock_core(ticker, name, df_for_core, lookback, bc_breakout_days)  # [FIX] 파라미터 전달
             if core_res:
                 log_txt += " [Core:BUY]"
                 # 만약 Core는 Buy인데 trades에 신규 신호가 없다면? -> 강제 추가
@@ -612,7 +679,7 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                 'Recent Sell': last_sell,
                 'Recent Sell Price': last_trade['exit_price'],
                 'Current PnL (%)': current_pnl,  # 현재 수익률 추가
-                'df_daily': df_daily, 'trades': []
+                'df_daily': df_daily, 'trades': trades
             }
         # Removed: elif block for debug messages (no longer needed)
     except Exception as e:
@@ -781,6 +848,9 @@ with tab1:
         help="이 날짜 기준으로 조건을 만족하는 종목을 검색합니다. 백테스트 결과와 비교 검증 시 유용합니다."
     )
     
+    # 스마트 캐시 정책 안내
+    st.caption("💡 **스마트 캐시**: 과거 날짜 분석 시 캐시 활용, 최신 데이터 필요 시 자동 갱신됩니다.")
+    
     if st.button("� 실시간 종목 스캔 시작"):
         stock_list = get_stock_list_naver(market_sel, n_stocks_sel)
         results = []
@@ -790,8 +860,12 @@ with tab1:
         # 병렬 처리 최적화 (6 workers)
         cache_hit = 0
         cache_miss = 0
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            future_to_stock = {executor.submit(fetch_data, row['Code'], market_sel): row for _, row in stock_list.iterrows()}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # scan_date를 fetch_data에 전달하여 스마트 캐시 검증 활성화
+            future_to_stock = {
+                executor.submit(fetch_data, row['Code'], market_sel, scan_date=scan_date): row 
+                for _, row in stock_list.iterrows()
+            }
             
             success_count = 0
             fail_count = 0
@@ -799,7 +873,7 @@ with tab1:
             for i, future in enumerate(as_completed(future_to_stock)):
                 stock_row = future_to_stock[future]
                 try:
-                    result = future.result()
+                    result = future.result(timeout=30)  # 30초 타임아웃
                     if result is None:
                         fail_count += 1
                         continue
@@ -874,6 +948,8 @@ with tab1:
                             pass
                     else:
                         fail_count += 1
+                except TimeoutError:
+                    fail_count += 1
                 except Exception as e:
                     fail_count += 1
                 
@@ -890,7 +966,7 @@ with tab1:
             st.session_state['scan_results'] = results
             st.session_state['scan_market'] = market_sel
             st.session_state['scan_date'] = scan_date  # 검색 날짜 저장
-            st.info(f"📊 **성능 통계** | 캐시 활용: {cache_rate:.1f}% ({cache_hit}/{total_scanned}) | API 호출: {cache_miss}회")
+            st.info(f"📊 **성능 통계** | 캐시 활용: {cache_rate:.1f}% ({cache_hit}/{total_scanned}) | API 호출: {cache_miss}회" + (f" | ⚠️ 데이터 로드 실패: {fail_count}건" if fail_count > 0 else ""))
         else:
             # 결과가 없으면 이전 결과 초기화
             if 'scan_results' in st.session_state:
@@ -1054,9 +1130,10 @@ with tab2:
     with st.expander("📅 백테스트 기간 설정", expanded=False):
         col_d1, col_d2 = st.columns(2)
         with col_d1:
-            bt_start = st.date_input("시작일", value=datetime(2014, 1, 1))
+            # [FIX] key 추가하여 값 기억, max_value 확장
+            bt_start = st.date_input("시작일", value=datetime(2023, 1, 2), max_value=datetime(2030, 12, 31), key="bt_start_date")
         with col_d2:
-            bt_end = st.date_input("종료일", value=datetime.now())
+            bt_end = st.date_input("종료일", value=datetime.now(), max_value=datetime(2030, 12, 31), key="bt_end_date")
     
     with st.expander("📌 보유 포지션 처리", expanded=False):
         bt_force_liquidate = st.checkbox(
@@ -1102,7 +1179,7 @@ with tab2:
         }
         bt_results = []
         pb_bt = st.progress(0)
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=2) as executor:
             # [Optimization] 스크리너에서 이미 받은 데이터 재사용 (scan_data_map 활용)
             # scan_data_map은 위 Smart Feature 블록에서 (혹은 여기서 새로) 생성 필요
             scan_data_map = {}
@@ -1112,12 +1189,20 @@ with tab2:
                         scan_data_map[res['Code']] = res['df_daily']
 
             future_to_bt = {
-                executor.submit(process_backtest_stock, r['Code'], r['Name'], market_sel, cfg, r.to_dict(), scan_data_map.get(r['Code'])): r 
+                executor.submit(
+                    process_backtest_stock, 
+                    r['Code'], r['Name'], market_sel, cfg, r.to_dict(), 
+                    scan_data_map.get(r['Code']),
+                    bt_end  # scan_date로 전달 (백테스팅 종료일까지 데이터 필요)
+                ): r 
                 for _, r in stock_list.iterrows()
             }
             for i, future in enumerate(as_completed(future_to_bt)):
-                r_bt = future.result()
-                if r_bt: bt_results.append(r_bt)
+                try:
+                    r_bt = future.result(timeout=30)
+                    if r_bt: bt_results.append(r_bt)
+                except:
+                    pass  # 타임아웃/에러 시 건너뜀
                 pb_bt.progress((i+1)/len(future_to_bt))
         if bt_results:
             st.session_state['bt_results'] = bt_results
@@ -1222,11 +1307,15 @@ with tab2:
         )
         
         # 선택된 옵션에서 행번호 추출
-        selected_row = int(selected_option.split('#')[1].split(' - ')[0])
-        
-        # 선택된 종목 정보 저장
-        st.session_state['selected_stock_index'] = selected_row
-        sel_bt = df_summary.iloc[selected_row]['Name']
+        if selected_option:
+            selected_row = int(selected_option.split('#')[1].split(' - ')[0])
+            
+            # 선택된 종목 정보 저장
+            st.session_state['selected_stock_index'] = selected_row
+            sel_bt = df_summary.iloc[selected_row]['Name']
+        else:
+            selected_row = None
+            sel_bt = None
         
         row_bt = next(r for r in bt_res if r['Name'] == sel_bt)
         st.subheader("📍 매매 상세 분석 (Transaction Details)")
