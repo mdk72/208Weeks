@@ -179,11 +179,11 @@ def fetch_data(ticker, market, start_date="2010-01-01", scan_date=None):
         try:
             df = stock.get_market_ohlcv_by_date(start_date_pykrx, end_date, ticker)
         except Exception as pykrx_e:
-            # [DEBUG] 정확한 에러 원인 파악을 위해 예외 전파
-            raise Exception(f"pykrx API Error: {str(pykrx_e)}")
+            print(f"pykrx error for {ticker}: {pykrx_e}")
+            return None, False
         
         if df is None or df.empty:
-            raise Exception("Empty Data returned from pykrx")
+            return None, False
         
         # 컬럼명 통일 (pykrx: 시가, 고가, 저가, 종가 -> Open, High, Low, Close)
         df = df.rename(columns={
@@ -201,14 +201,14 @@ def fetch_data(ticker, market, start_date="2010-01-01", scan_date=None):
         
         # 데이터 유효성 검사
         if len(df) < 10:
-             raise Exception(f"Insufficient Data: {len(df)} rows")
+             return None, False
 
         save_to_cache(ticker, df)
         return df, False
         
     except Exception as e:
-        # 상위 호출부에서 에러 메시지를 수집할 수 있도록 예외 전파
-        raise e
+        print(f"fetch_data pykrx error for {ticker}: {e}")
+        return None, False
 
 
 def calculate_screener_performance(df_daily, entry_date, entry_price, segments):
@@ -944,7 +944,6 @@ with tab1:
             
             success_count = 0
             fail_count = 0
-            error_logs = []  # [DEBUG] 에러 로그 수집
             
             for i, future in enumerate(as_completed(future_to_stock)):
                 stock_row = future_to_stock[future]
@@ -952,7 +951,6 @@ with tab1:
                     result = future.result(timeout=30)  # 30초 타임아웃
                     if result is None:
                         fail_count += 1
-                        error_logs.append(f"{stock_row['Name']}({stock_row['Code']}): Unknown Error (Result is None)")
                         continue
                     
                     df, from_cache = result
@@ -971,7 +969,6 @@ with tab1:
                         
                         if df.empty:
                             fail_count += 1
-                            error_logs.append(f"{stock_row['Name']}: Empty Data after date filtering (Target: {target_date})")
                             continue
                         
                         # [FIX] 가격 반영 로직 (선택 날짜 기준)
@@ -1028,13 +1025,10 @@ with tab1:
                             pass
                     else:
                         fail_count += 1
-                        error_logs.append(f"{stock_row['Name']}: Empty Data (fetch_data returned None)")
                 except TimeoutError:
                     fail_count += 1
-                    error_logs.append(f"{stock_row['Name']}: Timeout Error")
                 except Exception as e:
                     fail_count += 1
-                    error_logs.append(f"{stock_row['Name']}: {str(e)}")
                 
                 # 진행률 및 상태 표시 업데이트
                 pb.progress((i + 1) / n_stocks_sel)
@@ -1049,9 +1043,6 @@ with tab1:
             st.warning("결과가 없습니다.")
             if fail_count > 0:
                 st.error(f"⚠️ 데이터 로드 실패가 {fail_count}건 발생했습니다. 서버 시간 설정이나 네트워크 문제일 수 있습니다.")
-                with st.expander("🔍 상세 에러 로그 보기 (상위 20개)"):
-                    for log in error_logs[:20]:
-                        st.write(log)
                 
             if 'scan_results' in st.session_state:
                 del st.session_state['scan_results']
