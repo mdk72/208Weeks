@@ -572,7 +572,9 @@ with tab2:
             if 'scan_results' in st.session_state:
                 for res in st.session_state['scan_results']:
                     if 'df_daily' in res:
-                        scan_data_map[res['Code']] = res['df_daily']
+                        # [FIX] Ensure clean code for mapping
+                        clean_code = str(res['Code']).lstrip("'")
+                        scan_data_map[clean_code] = res['df_daily']
 
             future_to_bt = {
                 executor.submit(
@@ -618,10 +620,11 @@ with tab2:
             # We can't easily count hits inside the future without changing return signature.
             # Workaround: Count how many had `pre_fetched_df` passed.
             for code in stock_list['Code']:
-                if code in scan_data_map:
+                clean_code = str(code).lstrip("'")
+                if clean_code in scan_data_map:
                     cache_hit_bt += 1
                 else: 
-                    cache_miss_bt += 1 # fetched inside function usually hits cache too if recently scanned
+                    cache_miss_bt += 1 
             
         if bt_results:
             st.session_state['bt_results'] = bt_results
@@ -735,11 +738,12 @@ with tab2:
         bt_col_list = []
         
         for idx, code in enumerate(sorted_codes):
-            if code in bt_res_map:
-                row_data = bt_res_map[code]
+            clean_code = str(code).lstrip("'")
+            if clean_code in bt_res_map:
+                row_data = bt_res_map[clean_code]
                 rows_ordered.append(row_data)
                 # 번호 붙여서 리스트 생성
-                bt_col_list.append(f"{idx}. {row_data['Name']} ({row_data['Ticker']})")
+                bt_col_list.append(f"{idx}. {row_data['Name']} ({clean_code})")
         
         selected_bt_stock = st.selectbox("상세 분석 종목 선택 (백테스트 결과)", bt_col_list)
         
