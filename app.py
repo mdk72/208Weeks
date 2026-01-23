@@ -373,7 +373,11 @@ with tab1:
         ]
         
         cols_to_show = [c for c in preferred_cols if c in df_disp.columns]
-        df_disp = df_disp[cols_to_show]
+        df_disp = df_disp[cols_to_show].copy()
+        
+        # [FIX] Ensure Code is always 6 digits (prevent Excel/Numeric striping of leading zeros)
+        if 'Code' in df_disp.columns:
+            df_disp['Code'] = df_disp['Code'].apply(lambda x: str(x).zfill(6))
         
         price_cols = ['매수가', '현재가', 'B/C 라인', '208주 최저', '208주 최고']
         for col in price_cols:
@@ -705,7 +709,11 @@ with tab2:
                        ('Code' if c == 'Ticker' else ('매수가' if c == 'Recent Buy Price' else '현재가'))
                        for c in cols]
         final_cols = [c for c in renamed_cols if c in existing_cols] + [c for c in existing_cols if c not in renamed_cols and c not in ['Max 수익률', 'Max 날짜', 'Min 수익률', 'Min 날짜']]
-        df_summary_display = df_summary_display[final_cols]
+        df_summary_display = df_summary_display[final_cols].copy()
+        
+        # [FIX] Ensure Code is always 6 digits
+        if 'Code' in df_summary_display.columns:
+            df_summary_display['Code'] = df_summary_display['Code'].apply(lambda x: str(x).zfill(6))
         
         if '매수가' in df_summary_display.columns:
             df_summary_display['매수가'] = df_summary_display['매수가'].apply(lambda x: f"{int(x):,}" if pd.notna(x) else '-')
