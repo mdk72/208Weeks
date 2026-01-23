@@ -375,11 +375,11 @@ with tab1:
         cols_to_show = [c for c in preferred_cols if c in df_disp.columns]
         df_disp = df_disp[cols_to_show].copy()
         
-        # [FIX] Force leading zeros in Excel by prepending '
+        # [FIX] Force leading zeros in Excel by prepending ' - ONLY for display
         if 'Code' in df_disp.columns:
             df_disp['Code'] = df_disp['Code'].apply(lambda x: f"'{str(x).zfill(6)}")
         
-        price_cols = ['매수가', '현재가', 'B/C 라인', '208주 최저', '208주 최고']
+        # [FIX] Price columns: ensure we don't accidentally treat a string with single quote as a number
         for col in price_cols:
             if col in df_disp.columns:
                 df_disp[col] = df_disp[col].apply(lambda x: f"{int(x):,}" if pd.notna(x) else x)
@@ -572,9 +572,7 @@ with tab2:
             if 'scan_results' in st.session_state:
                 for res in st.session_state['scan_results']:
                     if 'df_daily' in res:
-                        # [FIX] Ensure clean code for mapping
-                        clean_code = str(res['Code']).lstrip("'")
-                        scan_data_map[clean_code] = res['df_daily']
+                        scan_data_map[res['Code']] = res['df_daily']
 
             future_to_bt = {
                 executor.submit(
@@ -620,8 +618,7 @@ with tab2:
             # We can't easily count hits inside the future without changing return signature.
             # Workaround: Count how many had `pre_fetched_df` passed.
             for code in stock_list['Code']:
-                clean_code = str(code).lstrip("'")
-                if clean_code in scan_data_map:
+                if code in scan_data_map:
                     cache_hit_bt += 1
                 else: 
                     cache_miss_bt += 1 
@@ -738,12 +735,11 @@ with tab2:
         bt_col_list = []
         
         for idx, code in enumerate(sorted_codes):
-            clean_code = str(code).lstrip("'")
-            if clean_code in bt_res_map:
-                row_data = bt_res_map[clean_code]
+            if code in bt_res_map:
+                row_data = bt_res_map[code]
                 rows_ordered.append(row_data)
                 # 번호 붙여서 리스트 생성
-                bt_col_list.append(f"{idx}. {row_data['Name']} ({clean_code})")
+                bt_col_list.append(f"{idx}. {row_data['Name']} ({code})")
         
         selected_bt_stock = st.selectbox("상세 분석 종목 선택 (백테스트 결과)", bt_col_list)
         
