@@ -55,6 +55,14 @@ def get_cached_data(ticker, requested_start_date, scan_date=None):
         if df.empty or row is None:
             return None
 
+        # [Important] 캐시된 데이터의 시작 날짜 확인
+        # 요청된 시작 날짜보다 캐시 데이터가 늦게 시작하면(데이터 부족), 
+        # 새로 받아야 함. (단, 7일 정도의 초기 버퍼 허용)
+        first_data_date = pd.to_datetime(df['date'].iloc[0]).date()
+        req_start_date_obj = pd.to_datetime(requested_start_date).date()
+        if first_data_date > req_start_date_obj + pd.Timedelta(days=7):
+            return None
+
         # [Smart Cache] scan_date가 오늘이 아니라면(백테스트 검증 등 과거 날짜),
         # 오늘 날짜로 업데이트되었는지 굳이 엄격하게 따질 필요 없음.
         # 캐시된 데이터의 마지막 날짜가 scan_date보다 같거나 뒤라면 유효한 것으로 간주.
@@ -179,14 +187,44 @@ def fetch_data(ticker, market, start_date='2020-01-01', scan_date=None):
         
         try:
             df = stock.get_market_ohlcv_by_date(start_date_pykrx, end_date, ticker)
-        except Exception as pykrx_e:
-            print(f"pykrx error for {ticker}: {pykrx_e}")
-            return None, False
+        except Exception:
+            df = None
+
+        # pykrx 실패 시 yfinance 시도
+        if df is None or df.empty:
+            try:
+                import yfinance as yf
+                yf_ticker = f"{ticker}.KS"
+                df_yf = yf.download(yf_ticker, start=start_date, progress=False)
+                
+                if df_yf is None or df_yf.empty:
+                    # 코스닥 시도
+                    yf_ticker = f"{ticker}.KQ"
+                    df_yf = yf.download(yf_ticker, start=start_date, progress=False)
+                
+                if df_yf is not None and not df_yf.empty:
+                    df = df_yf
+                    
+                    # [Robustness] yfinance 0.2.x+ MultiIndex columns handle
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                        
+                    # yfinance 컬럼 매핑
+                    df = df.rename(columns={
+                        'Open': 'Open', 'High': 'High', 'Low': 'Low', 
+                        'Close': 'Close', 'Volume': 'Volume'
+                    })
+                    # 인덱스 타임존 제거
+                    if df.index.tz is not None:
+                        df.index = df.index.tz_localize(None)
+            except Exception as e:
+                # print(f"yfinance fallback error for {ticker}: {e}")
+                pass
         
         if df is None or df.empty:
             return None, False
         
-        # 컬럼명 통일
+        # 컬럼명 통일 (한글 -> 영어)
         df = df.rename(columns={
             '시가': 'Open',
             '고가': 'High', 
@@ -198,6 +236,10 @@ def fetch_data(ticker, market, start_date='2020-01-01', scan_date=None):
         df.index = pd.to_datetime(df.index)
         df.index.name = 'Date'
         
+        # 데이터 정합성 체크 (Price가 0인 경우 제외)
+        if 'Close' in df.columns:
+            df = df[df['Close'] > 0]
+        
         if len(df) < 10:
              return None, False
 
@@ -205,7 +247,7 @@ def fetch_data(ticker, market, start_date='2020-01-01', scan_date=None):
         return df, False
         
     except Exception as e:
-        print(f"fetch_data pykrx error for {ticker}: {e}")
+        # print(f"fetch_data error for {ticker}: {e}")
         return None, False
 
 def get_stock_list_naver(market_type, top_n=200):
@@ -241,6 +283,14 @@ def get_stock_list_naver(market_type, top_n=200):
                     name = a_tag.text.strip()
                     href = a_tag['href'] 
                     code = href.split('=')[-1].zfill(6)
+                    
+                    # [NEW] ETF 필터링: 주요 ETF 브랜드 포함 시 제외
+                    etf_keywords = [
+                        'KODEX', 'TIGER', 'ACE', 'KBSTAR', 'SOL', 'RISE', 'ARIRANG', 
+                        'HANARO', 'KINDEX', 'KOSEC', 'KOSEF', 'TREX', 'SMART', 'FOCUS', 'WOORI'
+                    ]
+                    if any(kw in name.upper() for kw in etf_keywords):
+                        continue
                     
                     try:
                         price_txt = tds[2].text.strip().replace(',', '')

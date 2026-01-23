@@ -110,9 +110,9 @@ def analyze_stock_core(ticker, name, df, lookback_weeks=208, bc_breakout_days=60
             return None
         
         # Condition 3: Above 20MA
-        df_temp = df.tail(30).copy()
-        df_temp['MA20'] = df_temp['Close'].rolling(window=20).mean()
-        curr_ma20 = float(df_temp['MA20'].iloc[-1])
+        # [Optimized] Calculate MA20 for the entire dataframe to return it for charting
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        curr_ma20 = float(df['MA20'].iloc[-1])
         
         if current_price < curr_ma20:
              return None
@@ -138,7 +138,13 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
         if pre_fetched_df is not None:
             df_daily = pre_fetched_df.copy()
         else:
-            result = fetch_data(ticker, market, scan_date=scan_date)
+            # config['start_date']와 lookback을 고려하여 충분한 기간의 데이터를 요청
+            bt_start_val = config.get('start_date', '2020-01-01')
+            lookback_val = config.get('lookback', 208)
+            dt_start = pd.to_datetime(bt_start_val)
+            fetch_start_bt = (dt_start - pd.Timedelta(weeks=int(lookback_val * 1.5))).strftime('%Y-%m-%d')
+
+            result = fetch_data(ticker, market, start_date=fetch_start_bt, scan_date=scan_date)
             if result is None:
                 df_daily = None
             else:
