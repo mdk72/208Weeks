@@ -646,7 +646,7 @@ with tab2:
                 if pd.notna(row['Recent Sell']) and pd.notna(row['Recent Sell Price']) else str(row['Recent Sell']), axis=1
             )
         
-        cols_to_drop = ['is_core_buy', 'is_new_signal', 'DebugInfo', 'Log', 'Recent Buy Price', 'Recent Sell Price']
+        cols_to_drop = ['is_core_buy', 'is_new_signal', 'DebugInfo', 'Log', 'Recent Buy Price', 'Recent Sell Price', 'from_cache']
         df_summary.drop(columns=cols_to_drop, errors='ignore', inplace=True)
         
         if 'Max 수익률' in df_summary.columns and 'Max 날짜' in df_summary.columns:
