@@ -697,7 +697,7 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
             
             # 신규 매수 신호인지 확인
             if trades[-1].get('is_new_signal', False):
-                last_sell = '🆕 신규'
+                last_sell = 'New'
             elif trades[-1]['exit_date'] is None:
                 last_sell = '보유중'
             else:
@@ -766,7 +766,44 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
     return None
 
 # --- UI Setup ---
-st.set_page_config(page_title="208주 6등분 스크리너", layout="wide")
+st.set_page_config(page_title="208-Week System", layout="wide")
+
+# [UI] Custom CSS for Minimalist Design
+st.markdown("""
+<style>
+    /* Global Font */
+    html, body, [class*="css"] {
+        font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, 'Helvetica Neue', 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
+    }
+    /* Headers */
+    h1, h2, h3 { font-weight: 700; letter-spacing: -0.5px; color: #111; }
+    
+    /* Button Style - Minimalist */
+    div.stButton > button {
+        background-color: #ffffff; color: #333333; border: 1px solid #e0e0e0;
+        border-radius: 6px; padding: 0.4rem 1rem; font-weight: 500;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.05); transition: all 0.2s ease;
+    }
+    div.stButton > button:hover {
+        border-color: #333333; background-color: #f8f9fa; box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    div.stButton > button:active { background-color: #f1f3f5; transform: translateY(1px); }
+    
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] { gap: 1.5rem; }
+    .stTabs [data-baseweb="tab"] {
+        height: 3rem; white-space: pre-wrap; background-color: transparent;
+        border-radius: 4px; color: #868e96; font-weight: 600;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: transparent !important; color: #111 !important; border-bottom: 2px solid #111;
+    }
+    
+    /* Metrics & Info */
+    .stAlert { border: 1px solid #eee; background-color: #fcfcfc; color: #333; }
+</style>
+""", unsafe_allow_html=True)
+
 init_db()
 
 import io
@@ -867,7 +904,7 @@ st.title(" 208-Week High-Speed System")
 
 
 with st.sidebar:
-    st.header("🔍 설정")
+    st.header("설정")
     
     # 설정 불러오기
     saved_settings = load_settings()
@@ -896,7 +933,7 @@ with st.sidebar:
         save_settings(current_settings)
     
     st.divider()
-    if st.button("🗑️ 가격 캐시 초기화", help="저장된 가격 데이터를 모두 삭제하고 새로 내려받습니다."):
+    if st.button("가격 캐시 초기화", help="저장된 가격 데이터를 모두 삭제하고 새로 내려받습니다."):
         try:
             if os.path.exists(CACHE_DB):
                 # DB 연결이 열려 있을 수 있으므로 연결 종료 시도는 못하지만, 파일 삭제 시도
@@ -908,10 +945,10 @@ with st.sidebar:
 
 
 
-tab1, tab2 = st.tabs(["📊 실시간 스크리너", "🧪 백테스팅"])
+tab1, tab2 = st.tabs(["실시간 스크리너", "백테스팅"])
 
 with tab1:
-    st.markdown("### 📍 실시간 종목 스크린")
+    st.markdown("### 실시간 종목 스크린")
     
     # [New] 검색 날짜 선택 (백테스트 검증용)
     import pytz
@@ -924,7 +961,8 @@ with tab1:
     )
     
     # 스마트 캐시 정책 안내
-    st.caption("💡 **스마트 캐시**: 과거 날짜 분석 시 캐시 활용, 최신 데이터 필요 시 자동 갱신됩니다.")
+    # 스마트 캐시 정책 안내
+    st.caption("**스마트 캐시**: 과거 날짜 분석 시 캐시 활용, 최신 데이터 필요 시 자동 갱신됩니다.")
     
     if st.button("� 실시간 종목 스캔 시작"):
         stock_list = get_stock_list_naver(market_sel, n_stocks_sel)
@@ -1042,7 +1080,7 @@ with tab1:
         if not results:
             st.warning("결과가 없습니다.")
             if fail_count > 0:
-                st.error(f"⚠️ 데이터 로드 실패가 {fail_count}건 발생했습니다. 서버 시간 설정이나 네트워크 문제일 수 있습니다.")
+                st.error(f"데이터 로드 실패가 {fail_count}건 발생했습니다. 서버 시간 설정이나 네트워크 문제일 수 있습니다.")
                 
             if 'scan_results' in st.session_state:
                 del st.session_state['scan_results']
@@ -1050,7 +1088,7 @@ with tab1:
             st.session_state['scan_results'] = results
             st.session_state['scan_market'] = market_sel
             st.session_state['scan_date'] = scan_date  # 검색 날짜 저장
-            st.info(f"📊 **성능 통계** | 캐시 활용: {cache_rate:.1f}% ({cache_hit}/{total_scanned}) | API 호출: {cache_miss}회" + (f" | ⚠️ 데이터 로드 실패: {fail_count}건" if fail_count > 0 else ""))
+            st.info(f"**성능 통계** | 캐시 활용: {cache_rate:.1f}% ({cache_hit}/{total_scanned}) | API 호출: {cache_miss}회" + (f" | 데이터 로드 실패: {fail_count}건" if fail_count > 0 else ""))
 
     # 스캔 결과 표시 (항상 표시)
     if 'scan_results' in st.session_state:
@@ -1150,7 +1188,7 @@ with tab1:
                 mode='markers+text',
                 name='매수 시점',
                 marker=dict(color='#00ff00', size=15, symbol='triangle-up'),
-                text=['🟢 BUY'],
+                text=['BUY'],
                 textposition='top center',
                 textfont=dict(size=14, color='#00ff00')
             ))
@@ -1174,7 +1212,7 @@ with tab1:
                         mode='markers+text',
                         name='매도 시점',
                         marker=dict(color='#ff0000', size=15, symbol='triangle-down'),
-                        text=['🔴 SELL'],
+                        text=['SELL'],
                         textposition='bottom center',
                         textfont=dict(size=14, color='#ff0000')
                     ))
@@ -1195,7 +1233,7 @@ with tab1:
 
 with tab2:
     st.subheader("초고속 백테스팅")
-    with st.expander("⚙️ 전략 설정", expanded=True):
+    with st.expander("전략 설정", expanded=True):
         c1, c2 = st.columns(2)
         with c1:
             bt_brk = st.checkbox("B/C 돌파 필수", value=True)
@@ -1206,7 +1244,7 @@ with tab2:
             bt_met = st.radio("매도 방식", ["목표 도달 후 20일선 이탈", "목표가 도달 시 즉시 매도"])
             bt_sl = st.number_input("손절 (%)", value=0.0)
     
-    with st.expander("📅 백테스트 기간 설정", expanded=False):
+    with st.expander("백테스트 기간 설정", expanded=False):
         col_d1, col_d2 = st.columns(2)
         with col_d1:
             # [FIX] key 추가하여 값 기억, max_value 확장
@@ -1214,14 +1252,14 @@ with tab2:
         with col_d2:
             bt_end = st.date_input("종료일", value=datetime.now(), max_value=datetime(2030, 12, 31), key="bt_end_date")
     
-    with st.expander("📌 보유 포지션 처리", expanded=False):
+    with st.expander("보유 포지션 처리", expanded=False):
         bt_force_liquidate = st.checkbox(
             "종료일 기준 강제 청산",
             value=False,
             help="체크: 보유 중인 포지션을 종료일 가격으로 강제 청산\n해제: 보유 중인 포지션을 '보유중'으로 표시"
         )
 
-    if st.button("🚀 초고속 분석 시작"):
+    if st.button("초고속 분석 시작"):
         stock_list = get_stock_list_naver(market_sel, n_stocks_sel)
         
         # [Smart Feature] 스크리너 결과 자동 포함 (순위 밖이라도 백테스트에 강제 포함)
@@ -1245,7 +1283,7 @@ with tab2:
                 
                 if new_rows:
                     stock_list = pd.concat([stock_list, pd.DataFrame(new_rows)], ignore_index=True)
-                    st.toast(f"💡 스크리너 발견 종목 {len(new_rows)}개를 백테스트 목록에 자동 추가했습니다!")
+                    st.toast(f"스크리너 발견 종목 {len(new_rows)}개를 백테스트 목록에 자동 추가했습니다!")
         cfg = {
             'buy_breakout':bt_brk, 'buy_ma20':bt_ma, 'buy_segment':bt_seg, 
             'exit_target':bt_tgt, 'exit_method':bt_met, 'stop_loss_pct':bt_sl,
@@ -1291,7 +1329,7 @@ with tab2:
         bt_res = st.session_state['bt_results']
         
         # [Moved] Summary Table Persisted Display
-        st.subheader("📊 백테스팅 결과 요약")
+        st.subheader("백테스팅 결과 요약")
         df_summary = pd.DataFrame(bt_res).drop(columns=['df_daily', 'trades'], errors='ignore')
         
         # 날짜 컬럼을 datetime 타입으로 변환 (정렬 기능 향상)
@@ -1304,12 +1342,12 @@ with tab2:
         start_date_filter = pd.Timestamp(bt_start)  # Streamlit date -> pandas Timestamp 변환
         mask_recent_activity = (
             (df_summary['Recent Buy'] >= start_date_filter) |  # 기간 내 매수
-            (df_summary['Recent Sell'] == '🆕 신규')  # 또는 신규 신호
+            (df_summary['Recent Sell'] == 'New')  # 또는 신규 신호
         )
         df_summary = df_summary[mask_recent_activity].copy()
 
         # 정렬 순서: 1. 신규 매수, 2. 최근 매수일
-        df_summary['_is_new'] = df_summary['Recent Sell'] == '🆕 신규'
+        df_summary['_is_new'] = df_summary['Recent Sell'] == 'New'
         df_summary = df_summary.sort_values(
             by=['_is_new', 'Recent Buy'], 
             ascending=[False, False]
