@@ -74,6 +74,7 @@ def analyze_stock_core(ticker, name, df, lookback_weeks=208, bc_breakout_days=60
     """핵심 분석 로직: 208주 6등분 및 전략 조건 확인"""
     try:
         if df is None or len(df) < lookback_weeks: return None
+        df = df.copy() # [FIX] Ensure we are working on a copy to avoid SettingWithCopyWarning
         df_weekly = df.resample('W').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'})
         if len(df_weekly) < lookback_weeks: return None
             
@@ -334,7 +335,7 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
         # 검증 로직 (analyze_stock_core 사용)
         try:
             end_date_ts = pd.Timestamp(config.get('end_date'))
-            df_for_core = df_daily[df_daily.index <= end_date_ts]
+            df_for_core = df_daily[df_daily.index <= end_date_ts].copy()
             core_res = analyze_stock_core(ticker, name, df_for_core, config.get('lookback', 208), bc_breakout_days)
             
             if core_res:
