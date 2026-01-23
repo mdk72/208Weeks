@@ -406,14 +406,15 @@ with tab1:
             curr_price = row_sel.get('현재가', 0)
             c2.caption(f"현재가: {int(curr_price):,}원")
             
-            pnl = row_sel.get('수익률', 0)
-            c3.metric("수익률", f"{pnl:+.1f}%")
-            if 'Max 수익률' in row_sel:
-                c3.caption(f"Max: {row_sel['Max 수익률']:+.1f}% ({row_sel['Max 날짜']})")
+            pnl = row_sel.get('수익률')
+            pnl_str = f"{pnl:+.1f}%" if pnl is not None else "-"
+            c3.metric("수익률", pnl_str)
+            if 'Max 수익률' in row_sel and row_sel['Max 수익률'] is not None:
+                c3.caption(f"Max: {row_sel['Max 수익률']:+.1f}% ({row_sel.get('Max 날짜', '-')})")
                 
             c4.metric("현재 상태", row_sel.get('상태', '-'))
-            if 'Min 수익률' in row_sel:
-                c4.caption(f"Min: {row_sel['Min 수익률']:+.1f}% ({row_sel['Min 날짜']})")
+            if 'Min 수익률' in row_sel and row_sel['Min 수익률'] is not None:
+                c4.caption(f"Min: {row_sel['Min 수익률']:+.1f}% ({row_sel.get('Min 날짜', '-')})")
 
             # 보유일 계산 (검색일 기준)
             s_date = st.session_state.get('scan_date', datetime.now(kst).date())
@@ -740,14 +741,15 @@ with tab2:
             curr_price = bt_row.get('Recent Sell Price', 0) # 매도 안했으면 현재가
             c2.caption(f"현재가: {int(curr_price):,}원")
             
-            pnl = bt_row.get('Current PnL (%)', 0)
-            c3.metric("수익률", f"{pnl:+.1f}%")
-            if 'Max 수익률' in bt_row:
-                c3.caption(f"Max: {bt_row['Max 수익률']:+.1f}% ({bt_row['Max 날짜']})")
+            pnl = bt_row.get('Current PnL (%)')
+            pnl_str = f"{pnl:+.1f}%" if pnl is not None else "-"
+            c3.metric("수익률", pnl_str)
+            if 'Max 수익률' in bt_row and bt_row['Max 수익률'] is not None:
+                c3.caption(f"Max: {bt_row['Max 수익률']:+.1f}% ({bt_row.get('Max 날짜', '-')})")
             
             c4.metric("현재 상태", bt_row.get('Recent Sell', '-'))
-            if 'Min 수익률' in bt_row:
-                c4.caption(f"Min: {bt_row['Min 수익률']:+.1f}% ({bt_row['Min 날짜']})")
+            if 'Min 수익률' in bt_row and bt_row['Min 수익률'] is not None:
+                c4.caption(f"Min: {bt_row['Min 수익률']:+.1f}% ({bt_row.get('Min 날짜', '-')})")
 
             c5.metric("보유일", f"{int(bt_row.get('Duration', 0))}일")
             
