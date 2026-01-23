@@ -1431,193 +1431,197 @@ with tab2:
             selected_row = None
             sel_bt = None
         
-        row_bt = next(r for r in bt_res if r['Name'] == sel_bt)
-        st.subheader("📍 매매 상세 분석 (Transaction Details)")
-        
-        # 1. 전체 차트 (Global View)
-        fig_global = go.Figure()
-        if row_bt['df_daily'] is not None:
-            fig_global.add_trace(go.Scatter(x=row_bt['df_daily'].index, y=row_bt['df_daily']['Close'], name='Price', line=dict(color='#d1d4dc', width=1)))
-        for t in row_bt['trades']:
-            color = "#26a69a" if t['pnl'] > 0 else "#ef5350"
-            fig_global.add_vrect(x0=t['entry_date'], x1=t['exit_date'], fillcolor=color, opacity=0.1, layer="below", line_width=0)
-        fig_global.update_layout(title=f"{sel_bt} 전체 흐름", height=300, template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722")
-        st.plotly_chart(fig_global, width='stretch')
-
-        # 2. 개별 매매 상세 차트 (Zoomed View)
-        for idx, t in enumerate(row_bt['trades']):
-            st.divider()
+        if sel_bt:
+            # 안전하게 찾기 (없으면 None 반환)
+            row_bt = next((r for r in bt_res if r['Name'] == sel_bt), None)
             
-            # 신규 매수 신호 여부 확인
-            is_new_signal = t.get('is_new_signal', False)
-            is_open_position = t['exit_date'] is None and not is_new_signal
-            
-            if is_new_signal:
-                status_text = "🆕 신규"
-            elif is_open_position:
-                status_text = "보유중"
-            else:
-                status_text = f"{t['pnl']:.2f}%"
-            
-            st.markdown(f"#### 🎯 Trade #{idx+1} 수익률: :{'blue' if t['pnl']>0 else 'red'}[{status_text}]")
-            
-            # 줌 범위 설정 (진입 3개월 전 ~ 청산/현재 1개월 후)
-            zoom_start = t['entry_date'] - timedelta(weeks=12)
-            if is_open_position or is_new_signal:
-                # 보유중인 경우 현재 날짜 기준
-                zoom_end = row_bt['df_daily'].index[-1] + timedelta(weeks=4)
-            else:
-                zoom_end = t['exit_date'] + timedelta(weeks=4)
-            
-            df_zoom = row_bt['df_daily'][(row_bt['df_daily'].index >= zoom_start) & (row_bt['df_daily'].index <= zoom_end)].copy()
-            
-            if df_zoom.empty: continue
-            
-            fig = go.Figure()
-            
-            # 세그먼트 가로선 그리기
-            labels_seg = ['L', 'A/B', 'B/C', 'C/D', 'D/E', 'E/F', 'H']
-            for i, level in enumerate(t['segments']):
-                # 주요 라인(B/C, D/E)은 진하게 표시
-                is_key_level = labels_seg[i] in ['B/C', 'D/E']
-                opacity = 0.4 if is_key_level else 0.15
-                width = 2 if is_key_level else 1
-                dash = "solid" if is_key_level else "dash"
-                fig.add_hline(y=level, line_dash=dash, line_width=width, line_color=f'rgba(255,255,255,{opacity})', annotation_text=labels_seg[i])
-            
-            # 주가 그리기
-            fig.add_trace(go.Scatter(x=df_zoom.index, y=df_zoom['Close'], name='Price', line=dict(color='#26a69a', width=2)))
-            
-            # 20일 이동평균선 추가 (매수 조건 확인용)
-            if 'MA20' in df_zoom.columns:
-                fig.add_trace(go.Scatter(x=df_zoom.index, y=df_zoom['MA20'], name='MA20', line=dict(color='#ffa726', width=1, dash='dot')))
-            
-            # 매수/매도 마커
-            fig.add_annotation(x=t['entry_date'], y=t['entry_price'], text="▲ BUY", showarrow=True, arrowhead=2, arrowwidth=2, arrowcolor="#42a5f5", ax=0, ay=30, font=dict(color="#42a5f5", size=12))
-            
-            if is_new_signal:
-                # 신규 매수 신호인 경우
-                fig.add_annotation(x=df_zoom.index[-1], y=t['exit_price'], text=f"🆕 신규 매수 신호", showarrow=True, arrowhead=2, arrowwidth=2, arrowcolor="#4caf50", ax=0, ay=-30, font=dict(color="#4caf50", size=12))
-                title_text = f"Trade #{idx+1} 상세 (진입 예정: {t['entry_date'].date()} - 🆕 신규)"
-            elif is_open_position:
-                # 보유중인 경우
-                fig.add_annotation(x=df_zoom.index[-1], y=t['exit_price'], text=f"💼 보유중 ({t['pnl']:.1f}%)", showarrow=True, arrowhead=2, arrowwidth=2, arrowcolor="#ffa726", ax=0, ay=-30, font=dict(color="#ffa726", size=12))
-                title_text = f"Trade #{idx+1} 상세 (진입: {t['entry_date'].date()} -> 보유중)"
-            else:
-                fig.add_annotation(x=t['exit_date'], y=t['exit_price'], text=f"▼ SELL ({t['pnl']:.1f}%)", showarrow=True, arrowhead=2, arrowwidth=2, arrowcolor="#ef5350", ax=0, ay=-30, font=dict(color="#ef5350", size=12))
-                title_text = f"Trade #{idx+1} 상세 (진입: {t['entry_date'].date()} -> 청산: {t['exit_date'].date()})"
-
-            fig.update_layout(title=title_text, height=450, template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722")
-            st.plotly_chart(fig, width='stretch')
-            
-        st.write("📋 매매 기록 테이블")
-        if row_bt['trades']:
-            df_trades = pd.DataFrame(row_bt['trades'])
-            df_daily_data = row_bt['df_daily']
-            
-            # [NEW] 각 거래별 Max/Min 수익률 계산
-            max_pnls = []
-            max_dates = []
-            min_pnls = []
-            min_dates = []
-            
-            for _, trade in df_trades.iterrows():
-                entry_date = trade['entry_date']
-                entry_price = trade['entry_price']
-                exit_date = trade['exit_date']
+            if row_bt:
+                st.subheader("📍 매매 상세 분석 (Transaction Details)")
                 
-                # 보유 기간의 데이터
-                df_period = df_daily_data[df_daily_data.index >= entry_date]
-                if pd.notna(exit_date):
-                    df_period = df_period[df_period.index <= exit_date]
-                
-                if len(df_period) > 0:
-                    df_period_copy = df_period.copy()
-                    df_period_copy['pnl_pct'] = (df_period_copy['Close'] / entry_price - 1) * 100
+                # 1. 전체 차트 (Global View)
+                fig_global = go.Figure()
+                if row_bt['df_daily'] is not None:
+                    fig_global.add_trace(go.Scatter(x=row_bt['df_daily'].index, y=row_bt['df_daily']['Close'], name='Price', line=dict(color='#d1d4dc', width=1)))
+                for t in row_bt['trades']:
+                    color = "#26a69a" if t['pnl'] > 0 else "#ef5350"
+                    fig_global.add_vrect(x0=t['entry_date'], x1=t['exit_date'], fillcolor=color, opacity=0.1, layer="below", line_width=0)
+                fig_global.update_layout(title=f"{sel_bt} 전체 흐름", height=300, template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722")
+                st.plotly_chart(fig_global, width='stretch')
+
+                # 2. 개별 매매 상세 차트 (Zoomed View)
+                for idx, t in enumerate(row_bt['trades']):
+                    st.divider()
                     
-                    max_pnl = df_period_copy['pnl_pct'].max()
-                    max_date = df_period_copy['pnl_pct'].idxmax()
-                    min_pnl = df_period_copy['pnl_pct'].min()
-                    min_date = df_period_copy['pnl_pct'].idxmin()
+                    # 신규 매수 신호 여부 확인
+                    is_new_signal = t.get('is_new_signal', False)
+                    is_open_position = t['exit_date'] is None and not is_new_signal
+                    
+                    if is_new_signal:
+                        status_text = "🆕 신규"
+                    elif is_open_position:
+                        status_text = "보유중"
+                    else:
+                        status_text = f"{t['pnl']:.2f}%"
+                    
+                    st.markdown(f"#### 🎯 Trade #{idx+1} 수익률: :{'blue' if t['pnl']>0 else 'red'}[{status_text}]")
+                    
+                    # 줌 범위 설정 (진입 3개월 전 ~ 청산/현재 1개월 후)
+                    zoom_start = t['entry_date'] - timedelta(weeks=12)
+                    if is_open_position or is_new_signal:
+                        # 보유중인 경우 현재 날짜 기준
+                        zoom_end = row_bt['df_daily'].index[-1] + timedelta(weeks=4)
+                    else:
+                        zoom_end = t['exit_date'] + timedelta(weeks=4)
+                    
+                    df_zoom = row_bt['df_daily'][(row_bt['df_daily'].index >= zoom_start) & (row_bt['df_daily'].index <= zoom_end)].copy()
+                    
+                    if df_zoom.empty: continue
+                    
+                    fig = go.Figure()
+                    
+                    # 세그먼트 가로선 그리기
+                    labels_seg = ['L', 'A/B', 'B/C', 'C/D', 'D/E', 'E/F', 'H']
+                    for i, level in enumerate(t['segments']):
+                        # 주요 라인(B/C, D/E)은 진하게 표시
+                        is_key_level = labels_seg[i] in ['B/C', 'D/E']
+                        opacity = 0.4 if is_key_level else 0.15
+                        width = 2 if is_key_level else 1
+                        dash = "solid" if is_key_level else "dash"
+                        fig.add_hline(y=level, line_dash=dash, line_width=width, line_color=f'rgba(255,255,255,{opacity})', annotation_text=labels_seg[i])
+                    
+                    # 주가 그리기
+                    fig.add_trace(go.Scatter(x=df_zoom.index, y=df_zoom['Close'], name='Price', line=dict(color='#26a69a', width=2)))
+                    
+                    # 20일 이동평균선 추가 (매수 조건 확인용)
+                    if 'MA20' in df_zoom.columns:
+                        fig.add_trace(go.Scatter(x=df_zoom.index, y=df_zoom['MA20'], name='MA20', line=dict(color='#ffa726', width=1, dash='dot')))
+                    
+                    # 매수/매도 마커
+                    fig.add_annotation(x=t['entry_date'], y=t['entry_price'], text="▲ BUY", showarrow=True, arrowhead=2, arrowwidth=2, arrowcolor="#42a5f5", ax=0, ay=30, font=dict(color="#42a5f5", size=12))
+                    
+                    if is_new_signal:
+                        # 신규 매수 신호인 경우
+                        fig.add_annotation(x=df_zoom.index[-1], y=t['exit_price'], text=f"🆕 신규 매수 신호", showarrow=True, arrowhead=2, arrowwidth=2, arrowcolor="#4caf50", ax=0, ay=-30, font=dict(color="#4caf50", size=12))
+                        title_text = f"Trade #{idx+1} 상세 (진입 예정: {t['entry_date'].date()} - 🆕 신규)"
+                    elif is_open_position:
+                        # 보유중인 경우
+                        fig.add_annotation(x=df_zoom.index[-1], y=t['exit_price'], text=f"💼 보유중 ({t['pnl']:.1f}%)", showarrow=True, arrowhead=2, arrowwidth=2, arrowcolor="#ffa726", ax=0, ay=-30, font=dict(color="#ffa726", size=12))
+                        title_text = f"Trade #{idx+1} 상세 (진입: {t['entry_date'].date()} -> 보유중)"
+                    else:
+                        fig.add_annotation(x=t['exit_date'], y=t['exit_price'], text=f"▼ SELL ({t['pnl']:.1f}%)", showarrow=True, arrowhead=2, arrowwidth=2, arrowcolor="#ef5350", ax=0, ay=-30, font=dict(color="#ef5350", size=12))
+                        title_text = f"Trade #{idx+1} 상세 (진입: {t['entry_date'].date()} -> 청산: {t['exit_date'].date()})"
+
+                    fig.update_layout(title=title_text, height=450, template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722")
+                    st.plotly_chart(fig, width='stretch')
+                    
+                st.write("📋 매매 기록 테이블")
+                if row_bt['trades']:
+                    df_trades = pd.DataFrame(row_bt['trades'])
+                    df_daily_data = row_bt['df_daily']
+                    
+                    # [NEW] 각 거래별 Max/Min 수익률 계산
+                    max_pnls = []
+                    max_dates = []
+                    min_pnls = []
+                    min_dates = []
+                    
+                    for _, trade in df_trades.iterrows():
+                        entry_date = trade['entry_date']
+                        entry_price = trade['entry_price']
+                        exit_date = trade['exit_date']
+                        
+                        # 보유 기간의 데이터
+                        df_period = df_daily_data[df_daily_data.index >= entry_date]
+                        if pd.notna(exit_date):
+                            df_period = df_period[df_period.index <= exit_date]
+                        
+                        if len(df_period) > 0:
+                            df_period_copy = df_period.copy()
+                            df_period_copy['pnl_pct'] = (df_period_copy['Close'] / entry_price - 1) * 100
+                            
+                            max_pnl = df_period_copy['pnl_pct'].max()
+                            max_date = df_period_copy['pnl_pct'].idxmax()
+                            min_pnl = df_period_copy['pnl_pct'].min()
+                            min_date = df_period_copy['pnl_pct'].idxmin()
+                        else:
+                            max_pnl = 0.0
+                            max_date = entry_date
+                            min_pnl = 0.0
+                            min_date = entry_date
+                        
+                        max_pnls.append(max_pnl)
+                        max_dates.append(max_date)
+                        min_pnls.append(min_pnl)
+                        min_dates.append(min_date)
+                    
+                    df_trades['Max 수익률'] = max_pnls
+                    df_trades['Max 날짜'] = max_dates
+                    df_trades['Min 수익률'] = min_pnls
+                    df_trades['Min 날짜'] = min_dates
+                    
+                    # 불필요한 컬럼 제거
+                    df_trades = df_trades.drop(columns=['segments', 'is_new_signal'], errors='ignore')
+                    
+                    # 날짜 포맷팅
+                    if 'entry_date' in df_trades.columns:
+                        df_trades['entry_date'] = pd.to_datetime(df_trades['entry_date']).dt.strftime('%Y-%m-%d')
+                    if 'exit_date' in df_trades.columns:
+                        df_trades['exit_date'] = df_trades['exit_date'].apply(
+                            lambda x: pd.to_datetime(x).strftime('%Y-%m-%d') if pd.notna(x) else '보유중'
+                        )
+                    if 'Max 날짜' in df_trades.columns:
+                        df_trades['Max 날짜'] = pd.to_datetime(df_trades['Max 날짜']).dt.strftime('%Y-%m-%d')
+                    if 'Min 날짜' in df_trades.columns:
+                        df_trades['Min 날짜'] = pd.to_datetime(df_trades['Min 날짜']).dt.strftime('%Y-%m-%d')
+                    
+                    # 가격 포맷팅 (천단위 쉼표)
+                    if 'entry_price' in df_trades.columns:
+                        df_trades['entry_price'] = df_trades['entry_price'].apply(
+                            lambda x: f"{int(x):,}" if pd.notna(x) else '-'
+                        )
+                    if 'exit_price' in df_trades.columns:
+                        df_trades['exit_price'] = df_trades['exit_price'].apply(
+                            lambda x: f"{int(x):,}" if pd.notna(x) else '-'
+                        )
+                    
+                    # 수익률 포맷팅
+                    if 'pnl' in df_trades.columns:
+                        df_trades['pnl'] = df_trades['pnl'].apply(
+                            lambda x: f"{x:+.1f}%" if pd.notna(x) else '-'
+                        )
+                    
+                    # Max/Min 수익/날짜 결합
+                    if 'Max 수익률' in df_trades.columns and 'Max 날짜' in df_trades.columns:
+                        df_trades['Max 수익/날짜'] = df_trades.apply(
+                            lambda row: f"+{row['Max 수익률']:.1f}% ({row['Max 날짜']})" 
+                            if pd.notna(row['Max 수익률']) and row['Max 수익률'] >= 0
+                            else f"{row['Max 수익률']:.1f}% ({row['Max 날짜']})",
+                            axis=1
+                        )
+                    
+                    if 'Min 수익률' in df_trades.columns and 'Min 날짜' in df_trades.columns:
+                        df_trades['Min 수익/날짜'] = df_trades.apply(
+                            lambda row: f"{row['Min 수익률']:.1f}% ({row['Min 날짜']})",
+                            axis=1
+                        )
+                    
+                    # 불필요한 중간 컬럼 제거
+                    df_trades = df_trades.drop(columns=['Max 수익률', 'Max 날짜', 'Min 수익률', 'Min 날짜'], errors='ignore')
+                    
+                    # 컬럼명 한글화
+                    df_trades = df_trades.rename(columns={
+                        'entry_date': '매수일',
+                        'entry_price': '매수가',
+                        'exit_date': '매도일',
+                        'exit_price': '매도가',
+                        'pnl': '수익률',
+                        'duration': '보유일'
+                    })
+                    
+                    # 인덱스 추가 (#)
+                    df_trades.insert(0, '#', range(len(df_trades)))
+                    
+                    # DataFrame으로 표시 (정렬 가능, 인덱스 숨김)
+                    st.dataframe(df_trades, width='stretch', hide_index=True)
                 else:
-                    max_pnl = 0.0
-                    max_date = entry_date
-                    min_pnl = 0.0
-                    min_date = entry_date
-                
-                max_pnls.append(max_pnl)
-                max_dates.append(max_date)
-                min_pnls.append(min_pnl)
-                min_dates.append(min_date)
-            
-            df_trades['Max 수익률'] = max_pnls
-            df_trades['Max 날짜'] = max_dates
-            df_trades['Min 수익률'] = min_pnls
-            df_trades['Min 날짜'] = min_dates
-            
-            # 불필요한 컬럼 제거
-            df_trades = df_trades.drop(columns=['segments', 'is_new_signal'], errors='ignore')
-            
-            # 날짜 포맷팅
-            if 'entry_date' in df_trades.columns:
-                df_trades['entry_date'] = pd.to_datetime(df_trades['entry_date']).dt.strftime('%Y-%m-%d')
-            if 'exit_date' in df_trades.columns:
-                df_trades['exit_date'] = df_trades['exit_date'].apply(
-                    lambda x: pd.to_datetime(x).strftime('%Y-%m-%d') if pd.notna(x) else '보유중'
-                )
-            if 'Max 날짜' in df_trades.columns:
-                df_trades['Max 날짜'] = pd.to_datetime(df_trades['Max 날짜']).dt.strftime('%Y-%m-%d')
-            if 'Min 날짜' in df_trades.columns:
-                df_trades['Min 날짜'] = pd.to_datetime(df_trades['Min 날짜']).dt.strftime('%Y-%m-%d')
-            
-            # 가격 포맷팅 (천단위 쉼표)
-            if 'entry_price' in df_trades.columns:
-                df_trades['entry_price'] = df_trades['entry_price'].apply(
-                    lambda x: f"{int(x):,}" if pd.notna(x) else '-'
-                )
-            if 'exit_price' in df_trades.columns:
-                df_trades['exit_price'] = df_trades['exit_price'].apply(
-                    lambda x: f"{int(x):,}" if pd.notna(x) else '-'
-                )
-            
-            # 수익률 포맷팅
-            if 'pnl' in df_trades.columns:
-                df_trades['pnl'] = df_trades['pnl'].apply(
-                    lambda x: f"{x:+.1f}%" if pd.notna(x) else '-'
-                )
-            
-            # Max/Min 수익/날짜 결합
-            if 'Max 수익률' in df_trades.columns and 'Max 날짜' in df_trades.columns:
-                df_trades['Max 수익/날짜'] = df_trades.apply(
-                    lambda row: f"+{row['Max 수익률']:.1f}% ({row['Max 날짜']})" 
-                    if pd.notna(row['Max 수익률']) and row['Max 수익률'] >= 0
-                    else f"{row['Max 수익률']:.1f}% ({row['Max 날짜']})",
-                    axis=1
-                )
-            
-            if 'Min 수익률' in df_trades.columns and 'Min 날짜' in df_trades.columns:
-                df_trades['Min 수익/날짜'] = df_trades.apply(
-                    lambda row: f"{row['Min 수익률']:.1f}% ({row['Min 날짜']})",
-                    axis=1
-                )
-            
-            # 불필요한 중간 컬럼 제거
-            df_trades = df_trades.drop(columns=['Max 수익률', 'Max 날짜', 'Min 수익률', 'Min 날짜'], errors='ignore')
-            
-            # 컬럼명 한글화
-            df_trades = df_trades.rename(columns={
-                'entry_date': '매수일',
-                'entry_price': '매수가',
-                'exit_date': '매도일',
-                'exit_price': '매도가',
-                'pnl': '수익률',
-                'duration': '보유일'
-            })
-            
-            # 인덱스 추가 (#)
-            df_trades.insert(0, '#', range(len(df_trades)))
-            
-            # DataFrame으로 표시 (정렬 가능, 인덱스 숨김)
-            st.dataframe(df_trades, width='stretch', hide_index=True)
-        else:
-            st.info("매매 기록이 없습니다.")
+                    st.info("매매 기록이 없습니다.")

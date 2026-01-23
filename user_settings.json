@@ -1,5 +1,5 @@
 {
-  "market": "KOSPI",
+  "market": "KOSDAQ",
   "lookback": 208,
   "n_stocks": 200,
   "bc_breakout_days": 20
