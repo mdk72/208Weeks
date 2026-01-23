@@ -6,6 +6,11 @@ import plotly.graph_objects as go
 import os
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+
+# Suppress external library warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated as an API.*")
 
 # Custom Modules
 from utils import load_settings, save_settings
@@ -817,7 +822,7 @@ with tab2:
                 
                 disp_cols = ['매수일', '매수가', '매도일', '매도가', '수익률', 'Max 수익률', 'Min 수익률', 'duration']
                 df_trades_disp = df_trades[disp_cols].rename(columns={'duration': '보유일'})
-                st.dataframe(df_trades_disp, use_container_width=True)
+                st.dataframe(df_trades_disp, width="stretch")
             else:
                 st.info("거래 내역이 없습니다.")
                 
@@ -870,6 +875,6 @@ with tab2:
                     margin=dict(l=20, r=20, t=30, b=20),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.warning("차트 데이터가 없습니다.")

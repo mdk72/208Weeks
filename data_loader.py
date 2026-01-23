@@ -6,6 +6,11 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 import pytz
+import warnings
+
+# Suppress external library warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated as an API.*")
 
 # Constants
 CACHE_DB = os.path.join(os.path.dirname(__file__), "price_cache.db")
