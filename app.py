@@ -207,10 +207,47 @@ def fetch_data(ticker, market, start_date="2010-01-01", scan_date=None):
         return df, False
         
     except Exception as e:
-        print(f"fetch_data error for {ticker}: {e}")
-        return None, False
-        # pykrx 실패 시 None 반환 (더 이상 yfinance 사용 안 함)
-        return None, False
+        print(f"fetch_data pykrx error for {ticker}: {e}")
+        
+        # [FALLBACK] pykrx 실패 시 yfinance 시도 (Streamlit Cloud IP 차단 대응)
+        try:
+            import yfinance as yf
+            
+            # 티커 변환 (KOSPI -> .KS, KOSDAQ -> .KQ)
+            yf_ticker = ticker
+            if market == 'KOSPI':
+                yf_ticker += '.KS'
+            elif market == 'KOSDAQ':
+                yf_ticker += '.KQ'
+            else:
+                 # 시장 정보가 없거나 모호하면 둘 다 시도
+                yf_ticker_ks = ticker + '.KS'
+                yf_ticker_kq = ticker + '.KQ'
+                # 단순히 .KS로 시도해보고 안되면 .KQ (여기서는 market 정보가 있다고 가정)
+                yf_ticker = yf_ticker_ks
+            
+            df = yf.download(yf_ticker, start=start_date, progress=False)
+            
+            if df is None or df.empty:
+                 return None, False
+
+            # yfinance는 MultiIndex 컬럼일 수 있음 ('Price', 'Ticker') -> 단일 레벨로 평탄화
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            
+            # 인덱스 이름 설정
+            df.index.name = 'Date'
+            
+            # 데이터 유효성 검사
+            if len(df) < 10:
+                return None, False
+                
+            save_to_cache(ticker, df)
+            return df, False
+            
+        except Exception as yf_e:
+            print(f"fetch_data yfinance error for {ticker}: {yf_e}")
+            return None, False
 
 
 def calculate_screener_performance(df_daily, entry_date, entry_price, segments):
