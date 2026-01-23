@@ -165,15 +165,24 @@ def fetch_data(ticker, market, start_date="2010-01-01", scan_date=None):
     # [NEW] pykrx 사용 (한국거래소 공식 데이터 - 안정적)
     try:
         from pykrx import stock
+        import pytz
         
-        # 종료일: 오늘
-        end_date = datetime.now().strftime('%Y%m%d')
+        # [FIX] 서버 타임존 문제 해결을 위해 한국 시간(KST) 사용
+        kst = pytz.timezone('Asia/Seoul')
+        now_kst = datetime.now(kst)
+        
+        # 종료일: 오늘 (한국 시간 기준)
+        end_date = now_kst.strftime('%Y%m%d')
         start_date_pykrx = datetime.strptime(start_date, '%Y-%m-%d').strftime('%Y%m%d')
         
-        # pykrx로 데이터 가져오기
-        df = stock.get_market_ohlcv_by_date(start_date_pykrx, end_date, ticker)
+        # pykrx로 데이터 가져오기 (에러 처리 강화)
+        try:
+            df = stock.get_market_ohlcv_by_date(start_date_pykrx, end_date, ticker)
+        except Exception as pykrx_e:
+            print(f"pykrx error for {ticker}: {pykrx_e}")
+            return None, False
         
-        if df.empty:
+        if df is None or df.empty:
             return None, False
         
         # 컬럼명 통일 (pykrx: 시가, 고가, 저가, 종가 -> Open, High, Low, Close)
@@ -198,6 +207,8 @@ def fetch_data(ticker, market, start_date="2010-01-01", scan_date=None):
         return df, False
         
     except Exception as e:
+        print(f"fetch_data error for {ticker}: {e}")
+        return None, False
         # pykrx 실패 시 None 반환 (더 이상 yfinance 사용 안 함)
         return None, False
 
@@ -905,9 +916,12 @@ with tab1:
     st.markdown("### 📍 실시간 종목 스크린")
     
     # [New] 검색 날짜 선택 (백테스트 검증용)
+    import pytz
+    kst = pytz.timezone('Asia/Seoul')
+    
     scan_date = st.date_input(
         "검색 기준 날짜",
-        value=datetime.now().date(),
+        value=datetime.now(kst).date(),
         help="이 날짜 기준으로 조건을 만족하는 종목을 검색합니다. 백테스트 결과와 비교 검증 시 유용합니다."
     )
     
@@ -1019,22 +1033,24 @@ with tab1:
                 # 진행률 및 상태 표시 업데이트
                 pb.progress((i + 1) / n_stocks_sel)
                 cache_rate = (cache_hit / (cache_hit + cache_miss) * 100) if (cache_hit + cache_miss) > 0 else 0
-                st_txt.text(f"분석 중... ({i+1}/{n_stocks_sel}) | 발견: {len(results)}개 | 캐시: {cache_rate:.0f}% ({cache_hit}/{cache_hit+cache_miss})")
+                st_txt.text(f"분석 중... ({i+1}/{n_stocks_sel}) | 발견: {len(results)}개 | 실패: {fail_count}건 | 캐시: {cache_rate:.0f}%")
         
         # 스캔 완료 통계
         total_scanned = cache_hit + cache_miss
         cache_rate = (cache_hit / total_scanned * 100) if total_scanned > 0 else 0
         
-        if results:
+        if not results:
+            st.warning("결과가 없습니다.")
+            if fail_count > 0:
+                st.error(f"⚠️ 데이터 로드 실패가 {fail_count}건 발생했습니다. 서버 시간 설정이나 네트워크 문제일 수 있습니다.")
+                
+            if 'scan_results' in st.session_state:
+                del st.session_state['scan_results']
+        else:
             st.session_state['scan_results'] = results
             st.session_state['scan_market'] = market_sel
             st.session_state['scan_date'] = scan_date  # 검색 날짜 저장
             st.info(f"📊 **성능 통계** | 캐시 활용: {cache_rate:.1f}% ({cache_hit}/{total_scanned}) | API 호출: {cache_miss}회" + (f" | ⚠️ 데이터 로드 실패: {fail_count}건" if fail_count > 0 else ""))
-        else:
-            # 결과가 없으면 이전 결과 초기화
-            if 'scan_results' in st.session_state:
-                del st.session_state['scan_results']
-            st.warning("결과가 없습니다.")
 
     # 스캔 결과 표시 (항상 표시)
     if 'scan_results' in st.session_state:
