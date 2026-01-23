@@ -179,11 +179,11 @@ def fetch_data(ticker, market, start_date="2010-01-01", scan_date=None):
         try:
             df = stock.get_market_ohlcv_by_date(start_date_pykrx, end_date, ticker)
         except Exception as pykrx_e:
-            print(f"pykrx error for {ticker}: {pykrx_e}")
-            return None, False
+            # [DEBUG] 정확한 에러 원인 파악을 위해 예외 전파
+            raise Exception(f"pykrx API Error: {str(pykrx_e)}")
         
         if df is None or df.empty:
-            return None, False
+            raise Exception("Empty Data returned from pykrx")
         
         # 컬럼명 통일 (pykrx: 시가, 고가, 저가, 종가 -> Open, High, Low, Close)
         df = df.rename(columns={
@@ -201,53 +201,14 @@ def fetch_data(ticker, market, start_date="2010-01-01", scan_date=None):
         
         # 데이터 유효성 검사
         if len(df) < 10:
-            return None, False
+             raise Exception(f"Insufficient Data: {len(df)} rows")
 
         save_to_cache(ticker, df)
         return df, False
         
     except Exception as e:
-        print(f"fetch_data pykrx error for {ticker}: {e}")
-        
-        # [FALLBACK] pykrx 실패 시 yfinance 시도 (Streamlit Cloud IP 차단 대응)
-        try:
-            import yfinance as yf
-            
-            # 티커 변환 (KOSPI -> .KS, KOSDAQ -> .KQ)
-            yf_ticker = ticker
-            if market == 'KOSPI':
-                yf_ticker += '.KS'
-            elif market == 'KOSDAQ':
-                yf_ticker += '.KQ'
-            else:
-                 # 시장 정보가 없거나 모호하면 둘 다 시도
-                yf_ticker_ks = ticker + '.KS'
-                yf_ticker_kq = ticker + '.KQ'
-                # 단순히 .KS로 시도해보고 안되면 .KQ (여기서는 market 정보가 있다고 가정)
-                yf_ticker = yf_ticker_ks
-            
-            df = yf.download(yf_ticker, start=start_date, progress=False)
-            
-            if df is None or df.empty:
-                 return None, False
-
-            # yfinance는 MultiIndex 컬럼일 수 있음 ('Price', 'Ticker') -> 단일 레벨로 평탄화
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            
-            # 인덱스 이름 설정
-            df.index.name = 'Date'
-            
-            # 데이터 유효성 검사
-            if len(df) < 10:
-                return None, False
-                
-            save_to_cache(ticker, df)
-            return df, False
-            
-        except Exception as yf_e:
-            print(f"fetch_data yfinance error for {ticker}: {yf_e}")
-            return None, False
+        # 상위 호출부에서 에러 메시지를 수집할 수 있도록 예외 전파
+        raise e
 
 
 def calculate_screener_performance(df_daily, entry_date, entry_price, segments):
@@ -983,6 +944,7 @@ with tab1:
             
             success_count = 0
             fail_count = 0
+            error_logs = []  # [DEBUG] 에러 로그 수집
             
             for i, future in enumerate(as_completed(future_to_stock)):
                 stock_row = future_to_stock[future]
@@ -990,6 +952,7 @@ with tab1:
                     result = future.result(timeout=30)  # 30초 타임아웃
                     if result is None:
                         fail_count += 1
+                        error_logs.append(f"{stock_row['Name']}({stock_row['Code']}): Unknown Error (Result is None)")
                         continue
                     
                     df, from_cache = result
@@ -1008,12 +971,15 @@ with tab1:
                         
                         if df.empty:
                             fail_count += 1
+                            error_logs.append(f"{stock_row['Name']}: Empty Data after date filtering (Target: {target_date})")
                             continue
                         
                         # [FIX] 가격 반영 로직 (선택 날짜 기준)
                         cur_p = stock_row.get('현재가', 0)
                         last_date = df.index[-1]
-                        today = pd.Timestamp(datetime.now().date())
+                        import pytz
+                        kst = pytz.timezone('Asia/Seoul')
+                        today = pd.Timestamp(datetime.now(kst).date())
                         
                         # 오늘 날짜를 선택한 경우: 실시간 가격 사용
                         if scan_date == today.date() and cur_p > 0:
@@ -1062,10 +1028,13 @@ with tab1:
                             pass
                     else:
                         fail_count += 1
+                        error_logs.append(f"{stock_row['Name']}: Empty Data (fetch_data returned None)")
                 except TimeoutError:
                     fail_count += 1
+                    error_logs.append(f"{stock_row['Name']}: Timeout Error")
                 except Exception as e:
                     fail_count += 1
+                    error_logs.append(f"{stock_row['Name']}: {str(e)}")
                 
                 # 진행률 및 상태 표시 업데이트
                 pb.progress((i + 1) / n_stocks_sel)
@@ -1080,6 +1049,9 @@ with tab1:
             st.warning("결과가 없습니다.")
             if fail_count > 0:
                 st.error(f"⚠️ 데이터 로드 실패가 {fail_count}건 발생했습니다. 서버 시간 설정이나 네트워크 문제일 수 있습니다.")
+                with st.expander("🔍 상세 에러 로그 보기 (상위 20개)"):
+                    for log in error_logs[:20]:
+                        st.write(log)
                 
             if 'scan_results' in st.session_state:
                 del st.session_state['scan_results']
