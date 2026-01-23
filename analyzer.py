@@ -135,9 +135,11 @@ def analyze_stock_core(ticker, name, df, lookback_weeks=208, bc_breakout_days=60
 
 def process_backtest_stock(ticker, name, market, config, current_row=None, pre_fetched_df=None, scan_date=None):
     """백테스팅 개별 종목 처리"""
+    from_cache_overall = False
     try:
         if pre_fetched_df is not None:
             df_daily = pre_fetched_df.copy()
+            from_cache_overall = True
         else:
             # config['start_date']와 lookback을 고려하여 충분한 기간의 데이터를 요청
             bt_start_val = config.get('start_date', '2020-01-01')
@@ -149,7 +151,7 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
             if result is None:
                 df_daily = None
             else:
-                df_daily, _ = result 
+                df_daily, from_cache_overall = result 
             
         lookback_days = config.get('lookback', 208)
         if df_daily is None or len(df_daily) < lookback_days:
@@ -401,7 +403,8 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                 'Win Rate (%)': (len([t for t in trades if t['pnl'] > 0]) / len(trades)) * 100 if trades else 0,
                 'Recent Buy': last_buy, 'Recent Sell': last_sell,
                 'Duration': last_trade['duration'],
-                'df_daily': df_daily, 'trades': trades
+                'df_daily': df_daily, 'trades': trades,
+                'from_cache': from_cache_overall
             }
     except:
         return {

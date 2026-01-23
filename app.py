@@ -375,10 +375,10 @@ with tab1:
         cols_to_show = [c for c in preferred_cols if c in df_disp.columns]
         df_disp = df_disp[cols_to_show].copy()
         
-        # [FIX] Ensure Code is always 6 digits without quote prefix
         if 'Code' in df_disp.columns:
             df_disp['Code'] = df_disp['Code'].apply(lambda x: str(x).zfill(6))
         
+        # [FIX] Explicitly define price_cols to avoid NameError
         price_cols = ['매수가', '현재가', 'B/C 라인', '208주 최저', '208주 최고']
         for col in price_cols:
             if col in df_disp.columns:
@@ -592,36 +592,15 @@ with tab2:
                     r_bt = future.result(timeout=30)
                     if r_bt: 
                         bt_results.append(r_bt)
-                        # Backtest result doesn't explicitly return cache status, 
-                        # but we can infer based on scan_data_map usage strategy.
-                        # Actually, process_backtest_stock calls fetch_data internally if not in map.
-                        # For now, simplistic counting isn't easy without return value modification.
-                        # We will assume: if code in scan_data_map -> cache hit. 
-                        # If not -> fetch_data called -> we need valid return from process function for accurate stats.
-                        # Let's count processed items as successful.
-                        # **Correction**: process_backtest_stock calls fetch_data. 
-                        # To enable stats, we need to modify process_backtest_stock or fetch_data tracking.
-                        # Given constraints, we will approximate or leave it for now, 
-                        # BUT the user specifically asked for it. 
-                        # Let's assume most were hits if we passed pre_fetched_df.
-                        # Better approach: We passed pre_fetched_df for all items in scan_results.
-                        # So those are hits. Others are misses/fetches.
-                        pass
+                        if r_bt.get('from_cache'):
+                            cache_hit_bt += 1
+                        else:
+                            cache_miss_bt += 1
                 except: pass
                 pb_bt.progress((i+1)/len(future_to_bt))
             
-            # [LOGIC IMPROVEMENT] Recalculate stats based on inputs
-            total_bt = len(stock_list)
-            # scan_data_map contains items already fetched.
-            # If we run backtest on the SAME list as screener, they are likely cached.
-            # However, `process_backtest_stock` returns `df_daily`.
-            # We can't easily count hits inside the future without changing return signature.
-            # Workaround: Count how many had `pre_fetched_df` passed.
-            for code in stock_list['Code']:
-                if code in scan_data_map:
-                    cache_hit_bt += 1
-                else: 
-                    cache_miss_bt += 1 
+            # [LOGIC IMPROVED] No longer using manual estimation loop
+            total_bt = len(bt_results)
             
         if bt_results:
             st.session_state['bt_results'] = bt_results
