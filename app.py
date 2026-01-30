@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated as an A
 
 # Custom Modules
 from utils import load_settings, save_settings
-from data_loader import init_db, fetch_data, get_stock_list_naver, CACHE_DB
+from data_loader import init_db, fetch_data, get_stock_list_naver, get_historical_market_cap_list, CACHE_DB
 from analyzer import analyze_stock_core, calculate_screener_performance, process_backtest_stock
 
 # --- UI Setup ---
@@ -538,22 +538,28 @@ with tab2:
         )
 
     if st.button("초고속 분석 시작"):
-        stock_list = get_stock_list_naver(market_sel, n_stocks_sel)
+        # [Point-in-Time Universe] 백테스트 시작일 기준 시총 리스트 가져오기 (생존편향 제거)
+        with st.spinner(f"{bt_start.strftime('%Y-%m-%d')} 기준 {market_sel} 시총 상위 {n_stocks_sel}개 종목 리스트를 구성 중..."):
+            stock_list = get_historical_market_cap_list(bt_start.strftime('%Y%m%d'), market_sel, n_stocks_sel)
         
-        if 'scan_results' in st.session_state:
-            scan_market = st.session_state.get('scan_market', None)
-            if scan_market == market_sel:
-                existing_codes = set(stock_list['Code'].values)
-                new_rows = []
-                for res in st.session_state['scan_results']:
-                    if res['Code'] not in existing_codes:
-                        last_price = 0
-                        if 'df_daily' in res and len(res['df_daily']) > 0:
-                             last_price = res['df_daily']['Close'].iloc[-1]
-                        new_rows.append({'Code': res['Code'], 'Name': res['Name'], '현재가': last_price})
-                if new_rows:
-                    stock_list = pd.concat([stock_list, pd.DataFrame(new_rows)], ignore_index=True)
-                    st.toast(f"스크리너 발견 종목 {len(new_rows)}개를 백테스트 목록에 자동 추가했습니다!")
+        if stock_list is None or stock_list.empty:
+            st.warning(
+                f"{bt_start.strftime('%Y-%m-%d')} 기준 유니버스를 구성할 수 없어 현재 시점 리스트를 사용합니다.",
+                icon="⚠️"
+            )
+            st.info(
+                "**참고**: 외부 라이브러리(pykrx) 오류로 인해 과거 시점의 전체 종목 리스트를 가져오지 못했습니다. "
+                "하지만 개별 종목의 과거 가격 데이터는 정상적으로 호출하여 백테스트를 진행합니다.",
+                icon="ℹ️"
+            )
+            stock_list = get_stock_list_naver(market_sel, n_stocks_sel)
+        else:
+            st.success(f"{bt_start.strftime('%Y-%m-%d')} 기준 유니버스로 백테스트를 진행합니다. (생존편향 제거됨)")
+        
+        # [NOTE] 과거 시점 유니버스일 경우, 현재 스크리너 결과를 합치는 것은 논리적으로 맞지 않을 수 있음
+        # 하지만 사용자가 "현재 관심 종목"의 과거 성과도 보고 싶을 수 있으므로 옵션으로 유지하거나
+        # 명확히 구분하는 것이 좋음. 여기서는 생존편향 제거가 목적이므로, 과거 유니버스에 집중하기 위해 자동 병합은 생략하거나 경고.
+        # 일단 사용자 요청에 따라 "유니버스 구성" 자체에 집중.
         
         cfg = {
             'buy_breakout':bt_brk, 'buy_ma20':bt_ma, 'buy_segment':bt_seg, 
@@ -567,6 +573,11 @@ with tab2:
         
         bt_results = []
         pb_bt = st.progress(0)
+        
+        excluded_no_data = 0
+        excluded_short_history = 0
+        delisted_count = 0
+        active_count = 0
         
         with ThreadPoolExecutor(max_workers=2) as executor:
             scan_data_map = {}
@@ -592,7 +603,23 @@ with tab2:
                 try:
                     r_bt = future.result(timeout=30)
                     if r_bt: 
-                        bt_results.append(r_bt)
+                        status = r_bt.get('status', 'active')
+                        
+                        if status == 'excluded_no_data':
+                            excluded_no_data += 1
+                        elif status == 'excluded_short_history':
+                            excluded_short_history += 1
+                        elif status == 'delisted':
+                            delisted_count += 1
+                            bt_results.append(r_bt) # 상장폐지 종목도 결과엔 포함
+                        elif status == 'active':
+                            active_count += 1
+                            bt_results.append(r_bt)
+                        elif status == 'no_trades':
+                             # 거래가 없어도 결과 리스트에는 포함 (수익률 0)
+                             active_count += 1
+                             bt_results.append(r_bt)
+                            
                         if r_bt.get('from_cache'):
                             cache_hit_bt += 1
                         else:
@@ -609,7 +636,13 @@ with tab2:
             # 성능 통계 (Backtest)
             total_processed_bt = cache_hit_bt + cache_miss_bt
             cache_rate_bt = (cache_hit_bt / total_processed_bt * 100) if total_processed_bt > 0 else 0
-            st.info(f"성능 통계 | 캐시 활용(추정): {cache_rate_bt:.1f}% ({cache_hit_bt}/{total_processed_bt}) | 데이터 로드 완료")
+            
+            stats_msg = f"분석 완료 | 유효 종목: {active_count}개 | 상장폐지(포함): {delisted_count}개"
+            if excluded_no_data > 0 or excluded_short_history > 0:
+                stats_msg += f" | 제외: {excluded_no_data + excluded_short_history}건 (데이터부족 등)"
+            
+            st.info(stats_msg)
+            st.caption(f"캐시 활용: {cache_rate_bt:.1f}%")
 
     if 'bt_results' in st.session_state:
         bt_res = st.session_state['bt_results']

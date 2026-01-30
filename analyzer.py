@@ -145,7 +145,8 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
             bt_start_val = config.get('start_date', '2020-01-01')
             lookback_val = config.get('lookback', 208)
             dt_start = pd.to_datetime(bt_start_val)
-            fetch_start_bt = (dt_start - pd.Timedelta(weeks=int(lookback_val * 1.5))).strftime('%Y-%m-%d')
+            # 안전하게 충분한 기간 확보 (2배)
+            fetch_start_bt = (dt_start - pd.Timedelta(weeks=int(lookback_val * 2))).strftime('%Y-%m-%d')
 
             result = fetch_data(ticker, market, start_date=fetch_start_bt, scan_date=scan_date)
             if result is None:
@@ -153,25 +154,33 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
             else:
                 df_daily, from_cache_overall = result 
             
+        if df_daily is None:
+             return {'Ticker': ticker, 'Name': name, 'status': 'excluded_no_data'}
+
         lookback_days = config.get('lookback', 208)
-        if df_daily is None or len(df_daily) < lookback_days:
-             return None # 데이터 부족
+        if len(df_daily) < lookback_days:
+             return {'Ticker': ticker, 'Name': name, 'status': 'excluded_short_history'}
         
         # 실시간 데이터 반영 (캐시된 데이터가 오늘짜가 아닐 경우 또는 업데이트)
         if current_row is not None:
             last_date = df_daily.index[-1]
-            today = pd.Timestamp(datetime.now().date())
+            # Timezone aware comparison handling
+            import pytz
+            kst = pytz.timezone('Asia/Seoul')
+            today_date = datetime.now(kst).date()
+            
             curr_price = float(current_row.get('현재가', 0))
             
             if curr_price > 0:
-                if last_date.date() < today.date():
+                if last_date.date() < today_date:
                     try:
+                        new_idx = pd.Timestamp(today_date)
                         new_row = pd.DataFrame({
                             'Open': [curr_price], 'High': [curr_price], 'Low': [curr_price], 'Close': [curr_price], 'Volume': [0]
-                        }, index=[today])
+                        }, index=[new_idx])
                         df_daily = pd.concat([df_daily, new_row])
                     except: pass
-                elif last_date.date() == today.date():
+                elif last_date.date() == today_date:
                     try:
                         df_daily.at[last_date, 'Close'] = curr_price
                         if curr_price > df_daily.at[last_date, 'High']: df_daily.at[last_date, 'High'] = curr_price
@@ -215,6 +224,15 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
         if end_date:
             df_test = df_test[df_test.index <= pd.Timestamp(end_date)]
         
+        # [Analysis] 데이터가 시뮬레이션 종료일까지 존재하는지 확인
+        is_delisted = False
+        if end_date and not df_test.empty:
+            bt_end_ts = pd.Timestamp(end_date)
+            final_date = df_test.index[-1]
+            # 마지막 데이터가 백테스트 종료일보다 7일 이상 전이면 상장폐지로 추정
+            if (bt_end_ts - final_date).days > 7:
+                is_delisted = True
+        
         for i in range(len(df_test)):
             low_208 = df_test['RollLow'].iloc[i]
             high_208 = df_test['RollHigh'].iloc[i]
@@ -239,8 +257,9 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                     
                 if is_buy and buy_breakout:
                     bnd = bounds[2] if buy_segment == "Segment C (B/C~C/D)" else bounds[1]
-                    # 최근 N일 내 B/C 이탈했었는지 체크
-                    was_below = float(df_test['Low'].iloc[max(0, i-bc_breakout_days):i].min()) <= bnd
+                    # [FIX] Look back in df_daily instead of df_test to catch breakouts before start_date
+                    idx_in_daily = df_daily.index.get_loc(curr_date)
+                    was_below = float(df_daily['Low'].iloc[max(0, idx_in_daily-bc_breakout_days):idx_in_daily].min()) <= bnd
                     if not was_below: is_buy = False
                 
                 if is_buy and buy_segment == "Segment C (B/C~C/D)":
@@ -275,29 +294,30 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
         
         # 보유 중 포지션 처리
         if position is not None:
-            if force_liquidate:
-                final_price = float(df_test['Close'].iloc[-1])
-                final_date = df_test.index[-1]
+            final_date = df_test.index[-1]
+            final_price = float(df_test['Close'].iloc[-1])
+            
+            if force_liquidate or is_delisted:
                 trades.append({
                     'entry_date': position['entry_date'], 'entry_price': position['entry_price'],
                     'exit_date': final_date, 'exit_price': final_price,
                     'pnl': (final_price / position['entry_price'] - 1) * 100,
                     'duration': (final_date - position['entry_date']).days,
-                    'segments': position['segments']
+                    'segments': position['segments'],
+                    'is_delisted': is_delisted
                 })
             else:
-                current_price = float(df_test['Close'].iloc[-1])
                 trades.append({
                     'entry_date': position['entry_date'], 'entry_price': position['entry_price'],
                     'exit_date': None,
-                    'exit_price': current_price,
-                    'pnl': (current_price / position['entry_price'] - 1) * 100,
-                    'duration': (df_test.index[-1] - position['entry_date']).days,
+                    'exit_price': final_price,
+                    'pnl': (final_price / position['entry_price'] - 1) * 100,
+                    'duration': (final_date - position['entry_date']).days,
                     'segments': position['segments']
                 })
 
         # 종료일 기준 신규 매수 신호 체크 (시그널 헌팅)
-        if position is None and len(df_test) > 0:
+        if position is None and len(df_test) > 0 and not is_delisted:
             last_idx = len(df_test) - 1
             low_208 = df_test['RollLow'].iloc[last_idx]
             high_208 = df_test['RollHigh'].iloc[last_idx]
@@ -317,7 +337,9 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                 
                 if is_buy and buy_breakout:
                     bnd = bounds[2] if buy_segment == "Segment C (B/C~C/D)" else bounds[1]
-                    was_below = float(df_test['Low'].iloc[max(0, last_idx-bc_breakout_days):last_idx].min()) <= bnd if last_idx > 0 else False
+                    # [FIX] Look back in df_daily instead of df_test for consistency
+                    idx_in_daily = df_daily.index.get_loc(curr_date)
+                    was_below = float(df_daily['Low'].iloc[max(0, idx_in_daily-bc_breakout_days):idx_in_daily].min()) <= bnd
                     if not was_below: is_buy = False
                 
                 if is_buy and buy_segment == "Segment C (B/C~C/D)":
@@ -334,25 +356,26 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                         'segments': bounds, 'is_new_signal': True
                     })
 
-        # 검증 로직 (analyze_stock_core 사용)
-        try:
-            end_date_ts = pd.Timestamp(config.get('end_date'))
-            df_for_core = df_daily[df_daily.index <= end_date_ts].copy()
-            core_res = analyze_stock_core(ticker, name, df_for_core, config.get('lookback', 208), bc_breakout_days)
-            
-            if core_res:
-                has_new_signal = any(t.get('is_new_signal') for t in trades)
-                if not has_new_signal:
-                    if position is None:
-                        trades.append({
-                            'entry_date': df_for_core.index[-1],
-                            'entry_price': float(df_for_core['Close'].iloc[-1]),
-                            'exit_date': None, 'exit_price': float(df_for_core['Close'].iloc[-1]),
-                            'pnl': 0.0, 'duration': 0,
-                            'segments': core_res['segments'],
-                            'is_new_signal': True
-                        })
-        except: pass
+        # 검증 로직 (analyze_stock_core 사용) - delisted된 종목은 제외
+        if not is_delisted:
+            try:
+                end_date_ts = pd.Timestamp(config.get('end_date'))
+                df_for_core = df_daily[df_daily.index <= end_date_ts].copy()
+                core_res = analyze_stock_core(ticker, name, df_for_core, config.get('lookback', 208), bc_breakout_days)
+                
+                if core_res:
+                    has_new_signal = any(t.get('is_new_signal') for t in trades)
+                    if not has_new_signal:
+                        if position is None:
+                            trades.append({
+                                'entry_date': df_for_core.index[-1],
+                                'entry_price': float(df_for_core['Close'].iloc[-1]),
+                                'exit_date': None, 'exit_price': float(df_for_core['Close'].iloc[-1]),
+                                'pnl': 0.0, 'duration': 0,
+                                'segments': core_res['segments'],
+                                'is_new_signal': True
+                            })
+            except: pass
                     
         if trades:
             last_trade = trades[-1]
@@ -365,9 +388,10 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                 else:
                     last_buy = last_trade['entry_date'].strftime('%Y-%m-%d')
             
-            current_pnl = trades[-1]['pnl'] if (trades[-1]['exit_date'] is None or trades[-1].get('is_new_signal', False)) else None
+            pnl_val = trades[-1]['pnl'] if (trades[-1]['exit_date'] is None or trades[-1].get('is_new_signal', False)) else None
             
             if trades[-1].get('is_new_signal', False): last_sell = 'New'
+            elif trades[-1].get('is_delisted', False): last_sell = f"상장폐지 ({trades[-1]['exit_date'].strftime('%Y-%m-%d')})"
             elif trades[-1]['exit_date'] is None: last_sell = '보유중'
             else: last_sell = trades[-1]['exit_date'].strftime('%Y-%m-%d')
             
@@ -395,7 +419,7 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                 'Ticker': ticker, 'Name': name, 
                 'Recent Buy Price': last_trade['entry_price'],
                 'Recent Sell Price': last_trade['exit_price'],
-                'Current PnL (%)': current_pnl,
+                'Current PnL (%)': pnl_val,
                 'Max 수익률': max_pnl, 'Max 날짜': max_pnl_date,
                 'Min 수익률': min_pnl, 'Min 날짜': min_pnl_date,
                 'Total PnL (%)': sum(t['pnl'] for t in trades),
@@ -404,7 +428,8 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
                 'Recent Buy': last_buy, 'Recent Sell': last_sell,
                 'Duration': last_trade['duration'],
                 'df_daily': df_daily, 'trades': trades,
-                'from_cache': from_cache_overall
+                'from_cache': from_cache_overall,
+                'status': 'active' if not is_delisted else 'delisted'
             }
     except:
         return {
@@ -412,6 +437,7 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
             'Trades': 0, 'Win Rate (%)': 0.0,
             'Recent Buy': '-', 'Recent Sell': '-',
             'Current PnL (%)': None,
-            'df_daily': None, 'trades': []
+            'df_daily': None, 'trades': [],
+             'status': 'error'
         }
-    return None
+    return {'Ticker': ticker, 'Name': name, 'status': 'no_trades'}

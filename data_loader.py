@@ -4,7 +4,7 @@ import threading
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import warnings
 
@@ -317,3 +317,95 @@ def get_stock_list_naver(market_type, top_n=200):
             {'Code':'373220', 'Name':'LG에너지솔루션'}, {'Code':'207940', 'Name':'삼성바이오로직스'},
             {'Code':'005380', 'Name':'현대차'}, {'Code':'000270', 'Name':'기아'}
         ])
+
+    except Exception as e:
+        print(f"Error fetching historical market cap: {e}")
+        return None
+
+def get_historical_market_cap_list(date_str, market_type, top_n=200):
+    """
+    특정 시점(date_str)의 시가총액 상위 종목 리스트를 가져옴 (생존편향 제거용)
+    date_str: 'YYYYMMDD' or 'YYYY-MM-DD'
+    market_type: 'KOSPI' or 'KOSDAQ'
+    """
+    try:
+        from pykrx import stock
+        import time
+        
+        # 날짜 포맷 정리
+        target_date = date_str.replace('-', '')
+        
+        # [REFACTORED] Improved error handling for pykrx failures
+        df = None
+        last_error = None
+        
+        # 1. 시가총액 데이터 가져오기 (휴장일 고려 역추적)
+        search_date = target_date
+        for i in range(10): 
+            try:
+                temp_df = stock.get_market_cap(search_date)
+                if temp_df is not None and not temp_df.empty:
+                    df = temp_df
+                    target_date = search_date # 실제 데이터를 찾은 날짜로 갱신
+                    break
+                
+                # 데이터가 없는 경우 (None or Empty) -> 휴장일 가능성
+                curr_dt = datetime.strptime(search_date, "%Y%m%d")
+                search_date = (curr_dt - timedelta(days=1)).strftime("%Y%m%d")
+                time.sleep(0.05) 
+            except Exception as e:
+                # 라이브러리 내부 에러 (KeyError, Encoding 등)
+                last_error = str(e)
+                break # 에러 발생 시 역추적 중단하고 실패 처리
+                
+        if df is None or df.empty:
+            # [SILENCED] Removed debug print to avoid terminal clutter as per user request
+            return None
+
+        # Ticker가 인덱스로 오므로 컬럼으로 변환
+        df = df.reset_index()
+        
+        # 코스피/코스닥 필터링
+        # 해당 날짜 기준의 티커 리스트 필요
+        tickers_kospi = stock.get_market_ticker_list(target_date, market="KOSPI")
+        tickers_kosdaq = stock.get_market_ticker_list(target_date, market="KOSDAQ")
+        
+        if market_type == "KOSPI":
+            df = df[df['티커'].isin(tickers_kospi)]
+        else:
+            df = df[df['티커'].isin(tickers_kosdaq)]
+            
+        # 시가총액 순 정렬
+        df = df.sort_values(by='시가총액', ascending=False)
+        
+        # ETF 필터링 (과거 시점 종목명 기준)
+        etf_keywords = [
+             'KODEX', 'TIGER', 'ACE', 'KBSTAR', 'SOL', 'RISE', 'ARIRANG', 
+             'HANARO', 'KINDEX', 'KOSEC', 'KOSEF', 'TREX', 'SMART', 'FOCUS', 'WOORI'
+        ]
+        
+        stocks = []
+        count = 0
+        for _, row in df.iterrows():
+            name = row['종목명']
+            # ETF 제외
+            if any(kw in name.upper() for kw in etf_keywords):
+                continue
+            # 스팩 제외 (종목명에 '스팩' 포함)
+            if '스팩' in name:
+                continue
+                
+            stocks.append({
+                'Code': row['티커'],
+                'Name': name,
+                '현재가': row['종가'] # 당시의 종가를 '현재가' 컨셉으로 사용
+            })
+            count += 1
+            if count >= top_n:
+                break
+            
+        # print(f"Historical Universe constructed for {target_date}: {len(stocks)} stocks")
+        return pd.DataFrame(stocks)
+    except Exception as e:
+        # print(f"Error fetching historical market cap: {e}")
+        return None
