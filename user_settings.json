@@ -1,6 +1,6 @@
 {
   "market": "KOSDAQ",
   "lookback": 208,
-  "n_stocks": 99,
+  "n_stocks": 300,
   "bc_breakout_days": 60
 }

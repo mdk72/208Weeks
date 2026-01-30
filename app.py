@@ -650,19 +650,27 @@ with tab2:
         st.subheader("백테스팅 결과 요약")
         df_summary = pd.DataFrame(bt_res).drop(columns=['df_daily', 'trades'], errors='ignore')
         
-        if 'Recent Buy' in df_summary.columns:
-            df_summary['Recent Buy'] = pd.to_datetime(df_summary['Recent Buy'], format='%Y-%m-%d', errors='coerce')
-        
-        start_date_filter = pd.Timestamp(bt_start)
-        mask_recent_activity = (
-            (df_summary['Recent Buy'] >= start_date_filter) |
-            (df_summary['Recent Sell'] == 'New')
-        )
-        df_summary = df_summary[mask_recent_activity].copy()
+        # [FIX] Filter to show only relevant results (Trades > 0 or New Signal)
+        # This restores the concise view (e.g. 50 stocks instead of 94) by hiding 'no_trades' cases.
+        if 'status' in df_summary.columns:
+            # We want to see:
+            # 1. Stocks with at least one trade
+            # 2. Stocks that currently have a 'New' signal
+            # 3. Exclude 'no_trades', 'error', 'excluded_...' etc.
+            mask_relevant = (df_summary['Trades'] > 0) | (df_summary['Recent Sell'] == 'New')
+            df_summary = df_summary[mask_relevant].copy()
 
-        df_summary['_is_new'] = df_summary['Recent Sell'] == 'New'
-        df_summary = df_summary.sort_values(by=['_is_new', 'Recent Buy'], ascending=[False, False])
-        df_summary.drop(columns=['_is_new'], inplace=True)
+        # [FIX] Ensure sorting works by using a hidden datetime column
+        if not df_summary.empty and 'Recent Buy' in df_summary.columns and 'Recent Sell' in df_summary.columns:
+            df_summary['_is_new'] = df_summary['Recent Sell'] == 'New'
+            
+            # [FIX] Specify format to avoid pd.to_datetime UserWarning
+            df_summary['_sort_date'] = pd.to_datetime(df_summary['Recent Buy'], format='%Y-%m-%d', errors='coerce')
+            
+            # Sort: New signals first, then by most trades, then by most recent buy date
+            df_summary = df_summary.sort_values(by=['_is_new', 'Trades', '_sort_date'], ascending=[False, False, False])
+            
+            df_summary.drop(columns=['_is_new', '_sort_date'], inplace=True, errors='ignore')
         
         df_summary = df_summary.reset_index(drop=True)
         df_summary.insert(0, '#', range(len(df_summary)))
@@ -684,17 +692,23 @@ with tab2:
         df_summary.drop(columns=cols_to_drop, errors='ignore', inplace=True)
         
         if 'Max 수익률' in df_summary.columns and 'Max 날짜' in df_summary.columns:
-            df_summary['Max 수익/날짜'] = df_summary.apply(
-                lambda row: f"+{row['Max 수익률']:.1f}% ({row['Max 날짜']})" if pd.notna(row['Max 수익률']) and row['Max 수익률'] >= 0
-                else f"{row['Max 수익률']:.1f}% ({row['Max 날짜']})", axis=1
-            )
+            def format_max_pnl(row):
+                val = row['Max 수익률']
+                dt = row['Max 날짜']
+                if pd.isna(val) or val is None: return '-'
+                prefix = "+" if val >= 0 else ""
+                return f"{prefix}{val:.1f}% ({dt})"
+            df_summary['Max 수익/날짜'] = df_summary.apply(format_max_pnl, axis=1)
         
         if 'Min 수익률' in df_summary.columns and 'Min 날짜' in df_summary.columns:
-            df_summary['Min 수익/날짜'] = df_summary.apply(
-                lambda row: f"{row['Min 수익률']:.1f}% ({row['Min 날짜']})" if pd.notna(row['Min 수익률']) else '-', axis=1
-            )
+            def format_min_pnl(row):
+                val = row['Min 수익률']
+                dt = row['Min 날짜']
+                if pd.isna(val) or val is None: return '-'
+                return f"{val:.1f}% ({dt})"
+            df_summary['Min 수익/날짜'] = df_summary.apply(format_min_pnl, axis=1)
         
-        pnl_cols = ['Total PnL (%)', 'Win Rate (%)', 'Current PnL (%)']
+        pnl_cols = ['Total PnL (%)', 'Win Rate (%)', 'Current PnL (%)', 'Realized PnL (%)']
         for col in pnl_cols:
             if col in df_summary.columns:
                 df_summary[col] = df_summary[col].apply(lambda x: f"{x:.1f}" if pd.notna(x) else '-')
@@ -702,7 +716,7 @@ with tab2:
         cols = [
             '#', 'Ticker', 'Name', 
             'Recent Buy Price', 'Recent Sell Price',
-            'Current PnL (%)', 
+            'Current PnL (%)', 'Realized PnL (%)',
             'Max 수익/날짜', 'Min 수익/날짜',
             'Total PnL (%)', 'Trades', 'Win Rate (%)', 
             'Duration',
@@ -713,15 +727,36 @@ with tab2:
         df_summary_display = df_summary_display.rename(columns={
             'Ticker': 'Code',
             'Recent Buy Price': '매수가',
-            'Recent Sell Price': '현재가',
+            'Recent Sell Price': '현재가/매도가',
+            'Current PnL (%)': '보유 수익률 (%)',
+            'Realized PnL (%)': '실현 수익률 (%)',
+            'Total PnL (%)': '누적 수익률 (%)',
             'Duration': '보유일'
         })
         
         existing_cols = df_summary_display.columns.tolist()
-        renamed_cols = [c if c not in ['Ticker', 'Recent Buy Price', 'Recent Sell Price'] else 
-                       ('Code' if c == 'Ticker' else ('매수가' if c == 'Recent Buy Price' else '현재가'))
-                       for c in cols]
-        final_cols = [c for c in renamed_cols if c in existing_cols] + [c for c in existing_cols if c not in renamed_cols and c not in ['Max 수익률', 'Max 날짜', 'Min 수익률', 'Min 날짜']]
+        final_cols = []
+        
+        # Define display order
+        display_map = {
+            '#': '#', 'Ticker': 'Code', 'Name': 'Name', 
+            'Recent Buy Price': '매수가', 'Recent Sell Price': '현재가/매도가',
+            'Current PnL (%)': '보유 수익률 (%)', 'Realized PnL (%)': '실현 수익률 (%)',
+            'Max 수익/날짜': 'Max 수익/날짜', 'Min 수익/날짜': 'Min 수익/날짜',
+            'Total PnL (%)': '누적 수익률 (%)', 'Trades': 'Trades', 'Win Rate (%)': 'Win Rate (%)', 
+            'Duration': '보유일', 'Recent Buy': 'Recent Buy', 'Recent Sell': 'Recent Sell'
+        }
+        
+        for original_col in cols:
+            mapped_name = display_map.get(original_col)
+            if mapped_name and mapped_name in existing_cols:
+                final_cols.append(mapped_name)
+        
+        # Add any remaining columns that were not in display_map
+        for c in existing_cols:
+            if c not in final_cols and c not in ['Max 수익률', 'Max 날짜', 'Min 수익률', 'Min 날짜']:
+                final_cols.append(c)
+                
         df_summary_display = df_summary_display[final_cols].copy()
         
         # [FIX] Ensure Code is always 6 digits without quote prefix
@@ -729,9 +764,9 @@ with tab2:
             df_summary_display['Code'] = df_summary_display['Code'].apply(lambda x: str(x).zfill(6))
         
         if '매수가' in df_summary_display.columns:
-            df_summary_display['매수가'] = df_summary_display['매수가'].apply(lambda x: f"{int(x):,}" if pd.notna(x) else '-')
-        if '현재가' in df_summary_display.columns:
-            df_summary_display['현재가'] = df_summary_display['현재가'].apply(lambda x: f"{int(x):,}" if pd.notna(x) else '-')
+            df_summary_display['매수가'] = df_summary_display['매수가'].apply(lambda x: f"{int(x):,}" if pd.notna(x) and x != '-' else x)
+        if '현재가/매도가' in df_summary_display.columns:
+            df_summary_display['현재가/매도가'] = df_summary_display['현재가/매도가'].apply(lambda x: f"{int(x):,}" if pd.notna(x) and x != '-' else x)
         
         st.dataframe(df_summary_display, width=1200, hide_index=True)
         st.divider()
@@ -776,9 +811,19 @@ with tab2:
             
             pnl = bt_row.get('Current PnL (%)')
             pnl_str = f"{pnl:+.1f}%" if pnl is not None else "-"
-            c3.metric("수익률", pnl_str)
+            c3.metric("보유 수익률", pnl_str) # Renamed label
+            
+            # Caption logic for Max/Realized info
+            caption_parts = []
             if 'Max 수익률' in bt_row and bt_row['Max 수익률'] is not None:
-                c3.caption(f"Max: {bt_row['Max 수익률']:+.1f}% ({bt_row.get('Max 날짜', '-')})")
+                caption_parts.append(f"Max: {bt_row['Max 수익률']:+.1f}%")
+            
+            realized_pnl = bt_row.get('Realized PnL (%)')
+            if realized_pnl is not None:
+                caption_parts.append(f"최근 실현: {realized_pnl:+.1f}%")
+            
+            if caption_parts:
+                c3.caption(" | ".join(caption_parts))
             
             c4.metric("현재 상태", bt_row.get('Recent Sell', '-'))
             if 'Min 수익률' in bt_row and bt_row['Min 수익률'] is not None:

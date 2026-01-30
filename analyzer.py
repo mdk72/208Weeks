@@ -395,7 +395,7 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
             elif trades[-1]['exit_date'] is None: last_sell = '보유중'
             else: last_sell = trades[-1]['exit_date'].strftime('%Y-%m-%d')
             
-            # Max/Min Calculate
+            # [FIX] Restore Max/Min PnL calculation for the most recent trade
             recent_entry_date = last_trade['entry_date']
             recent_entry_price = last_trade['entry_price']
             recent_exit_date = last_trade['exit_date']
@@ -414,30 +414,57 @@ def process_backtest_stock(ticker, name, market, config, current_row=None, pre_f
             else:
                 max_pnl = 0.0; max_pnl_date = recent_entry_date.strftime('%Y-%m-%d')
                 min_pnl = 0.0; min_pnl_date = recent_entry_date.strftime('%Y-%m-%d')
-            
+
+            # [FIX] Compounded total PnL calculation
+            compounded_pnl_val = 1.0
+            for t in trades:
+                 compounded_pnl_val *= (1 + t['pnl'] / 100)
+            total_pnl = (compounded_pnl_val - 1) * 100
+
+            # Realized PnL: Most recent finished trade's PnL
+            closed_trades = [t for t in trades if t['exit_date'] is not None and not t.get('is_new_signal')]
+            last_realized_pnl = closed_trades[-1]['pnl'] if closed_trades else None
+
             return {
                 'Ticker': ticker, 'Name': name, 
                 'Recent Buy Price': last_trade['entry_price'],
                 'Recent Sell Price': last_trade['exit_price'],
                 'Current PnL (%)': pnl_val,
+                'Realized PnL (%)': last_realized_pnl,
                 'Max 수익률': max_pnl, 'Max 날짜': max_pnl_date,
                 'Min 수익률': min_pnl, 'Min 날짜': min_pnl_date,
-                'Total PnL (%)': sum(t['pnl'] for t in trades),
+                'Total PnL (%)': total_pnl,
                 'Trades': len(trades), 
-                'Win Rate (%)': (len([t for t in trades if t['pnl'] > 0]) / len(trades)) * 100 if trades else 0,
+                'Win Rate (%)': (len([t for t in trades if t['pnl'] > 0]) / len(trades)) * 100 if trades else 0.0,
                 'Recent Buy': last_buy, 'Recent Sell': last_sell,
                 'Duration': last_trade['duration'],
                 'df_daily': df_daily, 'trades': trades,
                 'from_cache': from_cache_overall,
                 'status': 'active' if not is_delisted else 'delisted'
             }
-    except:
+    except Exception as e:
+        # print(f"Backtest error for {ticker}: {e}")
         return {
             'Ticker': ticker, 'Name': name, 'Total PnL (%)': 0.0,
             'Trades': 0, 'Win Rate (%)': 0.0,
             'Recent Buy': '-', 'Recent Sell': '-',
             'Current PnL (%)': None,
+            'Realized PnL (%)': None,
+            'Max 수익률': None, 'Max 날짜': None,
+            'Min 수익률': None, 'Min 날짜': None,
+            'Duration': 0,
             'df_daily': None, 'trades': [],
              'status': 'error'
         }
-    return {'Ticker': ticker, 'Name': name, 'status': 'no_trades'}
+    return {
+        'Ticker': ticker, 'Name': name, 'Total PnL (%)': 0.0,
+        'Trades': 0, 'Win Rate (%)': 0.0,
+        'Recent Buy': '-', 'Recent Sell': '-',
+        'Current PnL (%)': None,
+        'Realized PnL (%)': None,
+        'Max 수익률': None, 'Max 날짜': None,
+        'Min 수익률': None, 'Min 날짜': None,
+        'Duration': 0,
+        'df_daily': None, 'trades': [],
+        'status': 'no_trades'
+    }
