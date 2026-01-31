@@ -13,7 +13,8 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
 warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated as an API.*")
 
 # Constants
-CACHE_DB = os.path.join(os.path.dirname(__file__), "price_cache.db")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CACHE_DB = os.path.join(BASE_DIR, "price_cache.db")
 db_lock = threading.Lock()
 
 def init_db():
@@ -167,7 +168,7 @@ def save_to_cache(ticker, df):
             conn.close()
             
     except Exception as e:
-        print(f"Cache save error for {ticker}: {e}")
+        # print(f"Cache save error for {ticker}: {e}")
         pass
 
 def fetch_data(ticker, market, start_date='2020-01-01', scan_date=None):
@@ -318,9 +319,6 @@ def get_stock_list_naver(market_type, top_n=200):
             {'Code':'005380', 'Name':'현대차'}, {'Code':'000270', 'Name':'기아'}
         ])
 
-    except Exception as e:
-        print(f"Error fetching historical market cap: {e}")
-        return None
 
 def get_historical_market_cap_list(date_str, market_type, top_n=200):
     """

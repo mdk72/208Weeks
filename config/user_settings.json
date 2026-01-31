@@ -1,0 +1,17 @@
+{
+  "market": "KOSDAQ",
+  "lookback": 208,
+  "n_stocks": 100,
+  "bc_breakout_days": 60,
+  "max_holding_months": 6,
+  "defense_trailing_pct": 0.0,
+  "profit_trailing_pct": 40.0,
+  "bc_exit_days": 0,
+  "exit_target": "D/E Boundary",
+  "exit_method": "목표가 도달 후 트레일링스탑",
+  "stop_loss_pct": 0.0,
+  "bt_start_date": "2024-01-02",
+  "bt_end_date": "2026-01-31",
+  "cooldown_days": 30,
+  "inv_per_stock": 500
+}
