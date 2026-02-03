@@ -2,15 +2,14 @@ import os
 import sys
 
 # Add the project root directory to the Python path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
-# Import the main application module
-# This works because Streamlit scripts usually execute code at the module level.
-# Importing it effectively runs the app.
-try:
-    from src.ui import app
-except Exception as e:
-    import streamlit as st
-    st.error(f"Error loading application: {e}")
-    st.error("Please check the logs for more details.")
-    raise e
+# Run the actual application script
+# Using exec ensures that the code runs every time Streamlit reruns this script.
+app_path = os.path.join(ROOT_DIR, "src", "ui", "app.py")
+with open(app_path, encoding='utf-8') as f:
+    code = f.read()
+    # Execute with inherited globals and local __file__ set correctly
+    exec(code, globals(), {"__file__": app_path, "__name__": "__main__"})
