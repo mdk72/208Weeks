@@ -73,7 +73,7 @@ class StockEasyDB:
         conn.commit()
         conn.close()
         
-        logger.info(f"StockEasy DB 연결 완료: {self.db_path}")
+        # logger.info(f"StockEasy DB 연결 완료: {self.db_path}")
     
     def save_snapshot(self, stock_data: Dict[str, Dict], snapshot_date: Optional[str] = None) -> int:
         """

@@ -1275,7 +1275,10 @@ with tab2:
                     
                     for t in r['trades']:
                         entry_dt = pd.Timestamp(t['entry_date']).floor('D')
-                        exit_dt = pd.Timestamp(t['exit_date']).floor('D') if t['exit_date'] else all_dates[-1]
+                        if all_dates.empty:
+                            exit_dt = entry_dt # Fallback if dates are messed up
+                        else:
+                            exit_dt = pd.Timestamp(t['exit_date']).floor('D') if t['exit_date'] else all_dates[-1]
                         
                         entry_price = t['entry_price']
                         inv_amount = bt_inv_amount * 10000
