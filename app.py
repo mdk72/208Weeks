@@ -397,7 +397,8 @@ with tab1:
         if insufficient_data > 0: perf_msg += f" | 상장 전: {insufficient_data}건"
         
         # [TERMINAL LOG] Summary only (Always print for all markets)
-        print(f"\n[Stock Scanner Summary] {perf_msg}")
+        print(f"[Stock Scanner Summary] {perf_msg}")
+        print("실시간 스크리닝이 완료되었습니다.")
 
         if not results:
             st.warning("결과가 없습니다.")
@@ -987,6 +988,7 @@ with tab2:
                 stats_msg += f" | 제외: {excluded_no_data + excluded_short_history}건 (데이터부족 등)"
             
             st.info(stats_msg)
+            print("백테스팅이 완료되었습니다.")
             st.caption(f"캐시 활용: {cache_rate_bt:.1f}%")
 
     if 'bt_results' in st.session_state:
@@ -1846,9 +1848,21 @@ with tab3:
                         
                         # 차트 그리기
                         st.markdown("#### 208주 역발상 차트")
+                        
+                        # Checkbox for Dynamic Boundaries
+                        col_dyn1, col_dyn2 = st.columns([3, 1])
+                        with col_dyn2:
+                            show_dynamic_detail = st.checkbox("동적 경계선 보기", key="dyn_bound_detail", help="208주 최고/최저가를 기반으로 변동하는 동적 경계선을 차트에 표시합니다.")
+
                         df_chart = df.copy()
                         df_chart['MA20'] = df_chart['Close'].rolling(window=20).mean()
                         
+                        # Calculate Rolling High/Low locally for dynamic view if not present
+                        # (Normally analyze_stock_core doesn't return full rolling daily series, but we have df)
+                        if show_dynamic_detail:
+                            df_chart['RollLow'] = df_chart['Low'].rolling(window=lookback_sel).min()
+                            df_chart['RollHigh'] = df_chart['High'].rolling(window=lookback_sel).max()
+
                         fig = go.Figure()
                         # 가격
                         fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['Close'], name='가격', line=dict(color='#2c3e50', width=2)))
@@ -1856,10 +1870,31 @@ with tab3:
                         fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['MA20'], name='20일선', line=dict(color='#e67e22', width=1, dash='dot')))
                         
                         # 경계선
-                        colors = ['#f1f3f5', '#d0ebff', '#a5d8ff', '#ffd8a8', '#ffc078', '#ff922b']
-                        labels = ['A/B (1/6)', 'B/C (2/6)', 'C/D (3/6)', 'D/E (4/6)', 'E/F (5/6)', '208주 최고']
-                        for i, level in enumerate(res['segments']):
-                            fig.add_hline(y=level, line_dash="dash", line_color="rgba(150,150,150,0.3)", annotation_text=labels[i] if i < len(labels) else "")
+                        if show_dynamic_detail:
+                            if 'RollLow' in df_chart.columns and 'RollHigh' in df_chart.columns:
+                                r_high = df_chart['RollHigh']
+                                r_low = df_chart['RollLow']
+                                r_step = (r_high - r_low) / 6
+                                
+                                boundary_names = ["A/B (1/6)", "B/C (2/6)", "C/D (3/6)", "D/E (4/6)", "E/F (5/6)"]
+                                colors = ["rgba(150,150,150,0.3)", "rgba(100,100,100,0.5)", "rgba(100,100,100,0.5)", "rgba(100,100,100,0.5)", "rgba(150,150,150,0.3)"]
+                                
+                                for j in range(1, 6):
+                                    line_val = r_low + j * r_step
+                                    fig.add_trace(go.Scatter(
+                                        x=df_chart.index, y=line_val,
+                                        name=boundary_names[j-1],
+                                        line=dict(color=colors[j-1], width=1, dash='dash'),
+                                        hoverinfo='skip',
+                                    ))
+                                    
+                                fig.add_trace(go.Scatter(x=df_chart.index, y=r_low, name='208주 최저', line=dict(color='rgba(200,50,50,0.3)', width=1), showlegend=True))
+                                fig.add_trace(go.Scatter(x=df_chart.index, y=r_high, name='208주 최고', line=dict(color='rgba(50,50,200,0.3)', width=1), showlegend=True))
+                        else:
+                            # Static Boundaries (Original)
+                            labels = ['A/B (1/6)', 'B/C (2/6)', 'C/D (3/6)', 'D/E (4/6)', 'E/F (5/6)', '208주 최고']
+                            for i, level in enumerate(res['segments']):
+                                fig.add_hline(y=level, line_dash="dash", line_color="rgba(150,150,150,0.3)", annotation_text=labels[i] if i < len(labels) else "")
 
                         fig.update_layout(
                             template="plotly_white", height=600, hovermode='x unified',
@@ -1871,6 +1906,8 @@ with tab3:
                         # 상세 데이터 테이블
                         with st.expander("분석 데이터 상세 보기"):
                             st.write(res)
+                        
+                        print(f"'{name}' 상세 분석이 완료되었습니다.")
                     else:
                         st.error("종목 분석 중 오류가 발생했습니다.")
                 else:
