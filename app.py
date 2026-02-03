@@ -35,13 +35,7 @@ import src.data.utils as utils
 import src.data.loader as loader
 import src.strategies.reversal_208 as reversal_208
 import src.engine.backtester as backtester
-from src.stock_analyzer import view as stockeasy_view
-
-# import importlib
-# importlib.reload(utils)
-# importlib.reload(loader)
-# importlib.reload(reversal_208)
-# importlib.reload(backtester)
+import src.stock_analyzer.view as stockeasy_view
 
 from src.data.loader import init_db, fetch_data, get_stock_list_naver, get_historical_market_cap_list, CACHE_DB
 from src.strategies.reversal_208 import analyze_stock_core, calculate_screener_performance
