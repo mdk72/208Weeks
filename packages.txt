@@ -1,0 +1,4 @@
+chromium
+chromium-driver
+libxml2-dev
+libxslt-dev
