@@ -3,8 +3,8 @@ import sys
 import os
 
 def launch():
-    """Launch the Streamlit app in the new modular structure."""
-    app_path = os.path.join("src", "ui", "app.py")
+    """Launch the Streamlit app in the new standardized structure."""
+    app_path = "app.py"
     if not os.path.exists(app_path):
         print(f"Error: Could not find {app_path}")
         return
