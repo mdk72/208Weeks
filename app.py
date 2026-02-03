@@ -384,6 +384,9 @@ with tab1:
         if load_fail > 0: perf_msg += f" | 로드 실패: {load_fail}건"
         if insufficient_data > 0: perf_msg += f" | 상장 전: {insufficient_data}건"
         
+        # [TERMINAL LOG] Summary only (Always print for all markets)
+        print(f"\n[Stock Scanner Summary] {perf_msg}")
+
         if not results:
             st.warning("결과가 없습니다.")
             if load_fail > 0:
@@ -395,8 +398,6 @@ with tab1:
                 if insufficient_data > 0: parts.append(f"상장 전 종목({insufficient_data}건)")
                 if insufficient_history > 0: parts.append(f"{lookback_sel}주 미만/신규상장({insufficient_history}건)")
                 msg += " 및 ".join(parts) + "이 제외되었습니다."
-            # [TERMINAL LOG] Summary only (outside if/else to ensure print)
-            print(f"\n[Stock Scanner Summary] {perf_msg}")
 
             st.info(perf_msg)
             
@@ -407,9 +408,6 @@ with tab1:
             st.session_state['scan_date'] = scan_date
             
             st.success(f"{len(filtered_results)}개 종목 발견! (소요 시간: {min_seconds:.1f}초)")
-            
-            # 성능 통계 (Screener) - Moved up
-            # perf_msg construction moved up
             
             st.info(perf_msg)
             
