@@ -21,7 +21,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 from . import config
 
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class StockEasyScraper:

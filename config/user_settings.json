@@ -10,7 +10,7 @@
   "exit_target": "D/E Boundary",
   "exit_method": "목표가 도달 후 트레일링스탑",
   "stop_loss_pct": 0.0,
-  "bt_start_date": "2026-01-02",
+  "bt_start_date": "2025-01-02",
   "bt_end_date": "2026-02-02",
   "cooldown_days": 30,
   "inv_per_stock": 500

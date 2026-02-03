@@ -14,7 +14,7 @@ import pandas as pd
 
 from . import config
 
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig(level=logging.INFO) # Handled by main app.py
 logger = logging.getLogger(__name__)
 
 

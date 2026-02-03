@@ -22,13 +22,25 @@ warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated as an A
 
 import logging
 
-# Configure logging with timestamp
+# Configure logging
+# Set root level to WARNING to silence noisy library INFO logs (like pykrx)
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
-    force=True  # Force reconfiguration if already configured
+    force=True
 )
+
+# Enable INFO level for our own project code
+logging.getLogger("src").setLevel(logging.INFO)
+logging.getLogger("__main__").setLevel(logging.INFO)
+
+# Specifically silence very noisy or buggy external libraries
+logging.getLogger("pykrx").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("requests").setLevel(logging.ERROR)
+logging.getLogger("yfinance").setLevel(logging.ERROR)
+logging.getLogger("selenium").setLevel(logging.ERROR)
 
 # Custom Modules (Refactored paths)
 import src.data.utils as utils

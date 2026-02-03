@@ -8,7 +8,7 @@ import pandas as pd
 
 from . import config
 
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 

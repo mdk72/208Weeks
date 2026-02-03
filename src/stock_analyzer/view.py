@@ -26,7 +26,7 @@ from .ui import (
 )
 from . import config
 
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # 세션 상태 초기화 함수
