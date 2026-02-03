@@ -80,3 +80,38 @@ def save_history(history):
             json.dump(history, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
     except Exception as e:
         print(f"History save error: {e}")
+
+# Market Cap Snapshot Functions
+SNAPSHOT_FILE = os.path.join(BASE_DIR, "config", "market_cap_snapshots.json")
+
+def load_market_cap_snapshots():
+    """시가총액 스냅샷 데이터 불러오기"""
+    if os.path.exists(SNAPSHOT_FILE):
+        try:
+            with open(SNAPSHOT_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Snapshot load error: {e}")
+    # 초기 구조
+    return {"snapshots": {}, "version": "1.0"}
+
+def save_market_cap_snapshot(snapshot_data):
+    """시가총액 스냅샷 저장"""
+    try:
+        # Load existing snapshots
+        all_snapshots = load_market_cap_snapshots()
+        
+        # Merge new snapshot
+        all_snapshots["snapshots"].update(snapshot_data)
+        
+        # Create config directory if not exists
+        os.makedirs(os.path.dirname(SNAPSHOT_FILE), exist_ok=True)
+        
+        # Save
+        with open(SNAPSHOT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(all_snapshots, f, ensure_ascii=False, indent=2)
+        
+        return True
+    except Exception as e:
+        print(f"Snapshot save error: {e}")
+        return False

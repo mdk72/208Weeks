@@ -20,11 +20,22 @@ import yfinance as yf
 warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
 warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated as an API.*")
 
+import logging
+
+# Configure logging with timestamp
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    force=True  # Force reconfiguration if already configured
+)
+
 # Custom Modules (Refactored paths)
 import src.data.utils as utils
 import src.data.loader as loader
 import src.strategies.reversal_208 as reversal_208
 import src.engine.backtester as backtester
+from src.stock_analyzer import view as stockeasy_view
 
 import importlib
 importlib.reload(utils)
@@ -35,6 +46,7 @@ importlib.reload(backtester)
 from src.data.loader import init_db, fetch_data, get_stock_list_naver, get_historical_market_cap_list, CACHE_DB
 from src.strategies.reversal_208 import analyze_stock_core, calculate_screener_performance
 from src.engine.backtester import process_backtest_stock
+from src.stock_analyzer.db_manager import get_db
 
 # --- UI Setup ---
 st.set_page_config(page_title="208-Week System", layout="wide")
@@ -168,6 +180,37 @@ with st.sidebar:
         step=5,
         help="최근 N일 내 B/C 라인 아래 있었는지 확인. 짧을수록 신선한 돌파만, 길수록 더 많은 종목 포함."
     )
+    
+    # Market Cap Snapshot Section
+    st.divider()
+    st.caption("**📸 시총 스냅샷 (생존편향 제거)**")
+    
+    # Show snapshot status
+    from src.data import utils, loader
+    snapshots = utils.load_market_cap_snapshots()
+    snapshot_count = len(snapshots.get('snapshots', {}))
+    
+    if snapshot_count > 0:
+        latest_date = max(snapshots['snapshots'].keys())
+        st.info(f"💾 스냅샷 {snapshot_count}개 저장됨 (최신: {latest_date})")
+    else:
+        st.warning("⚠️ 저장된 스냅샷 없음")
+    
+    # Snapshot capture button
+    if st.button("📸 오늘의 스냅샷 저장", help="지금 시점의 시총 상위 종목을 저장 (생존편향 제거용)"):
+        with st.spinner(f"{market_sel} 상위 {n_stocks_sel}종목 가져오는 중..."):
+            success, date, result = loader.create_market_cap_snapshot(market_sel, n_stocks_sel)
+            
+            if success:
+                # Save snapshot
+                save_ok = utils.save_market_cap_snapshot(result)
+                if save_ok:
+                    st.success(f"✅ {date} {market_sel} 스냅샷 저장 완료!")
+                    st.rerun()
+                else:
+                    st.error("❌ 스냅샷 저장 실패")
+            else:
+                st.error(f"❌ 스냅샷 생성 실패: {result}")
     inv_per_stock_sel = st.sidebar.number_input(
         "종목당 투자금 (만원)",
         min_value=100,
@@ -187,7 +230,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"캐시 삭제 실패: {e}")
 
-tab1, tab2, tab3 = st.tabs(["실시간 스크리너", "백테스팅", "종목별 상세 분석"])
+tab1, tab2, tab3, tab4 = st.tabs(["실시간 스크리너", "백테스팅", "종목별 상세 분석", "StockEasy 분석"])
 
 with tab1:
     st.markdown("### 실시간 종목 스크린")
@@ -222,7 +265,11 @@ with tab1:
             }
             
             load_fail = 0
-            success_count = 0
+            load_fail = 0
+            cache_hit = 0
+            cache_miss = 0
+            cache_update = 0 # [NEW] 실시간 업데이트 횟수
+            api_calls = 0   # [NEW] 전체 호출 횟수
             insufficient_data = 0
             insufficient_history = 0
             
@@ -240,9 +287,31 @@ with tab1:
                         load_fail_names.append(f"{stock_row['Name']} (Fetch Error)")
                         continue
                     
-                    df, from_cache = result
-                    if from_cache: cache_hit += 1
-                    else: cache_miss += 1
+                    df, status_code = result
+                    
+                    # [STATISTICS UPDATE] 상세 통계 집계
+                    if status_code == "cache_update":
+                        cache_update += 1
+                        cache_hit += 1 # 캐시 기반이므로 hit로도 집계 (또는 별도 관리)
+                    elif status_code == "api":
+                        api_calls += 1
+                        cache_miss += 1
+                    else: # "cache" or True (backward compat)
+                        cache_hit += 1
+                    
+                    # [NEW] Check if today's data is actually present for real-time consistency
+                    today_date = datetime.now(kst).date()
+                    has_today_data = False
+                    if df is not None and not df.empty:
+                        last_date = df.index[-1].date()
+                        if last_date == today_date:
+                            has_today_data = True
+                    
+                    if status_code == "cache" and not has_today_data:
+                         # This implies we had cache but failed to update with Naver intraday
+                         # or market is closed/not updated yet.
+                         # If market IS open, this is a "Partial Fail" for real-time
+                         pass 
                     
                     if df is not None and not df.empty:
                         df_full_for_chart = df.copy()
@@ -314,6 +383,12 @@ with tab1:
         cache_rate = (cache_hit / total_attempted * 100) if total_attempted > 0 else 0
         
         min_seconds = (datetime.now() - start_time).total_seconds()
+
+        # 성능 통계 (Screener)
+        perf_msg = f"성능 통계 | 캐시 활용: {cache_rate:.1f}% ({cache_hit}/{total_attempted}) | 네트워크 사용: {api_calls + cache_update}회 (신규: {api_calls}, 갱신: {cache_update})"
+        if insufficient_history > 0: perf_msg += f" | {lookback_sel}주 미만(신규상장 등): {insufficient_history}건"
+        if load_fail > 0: perf_msg += f" | 로드 실패: {load_fail}건"
+        if insufficient_data > 0: perf_msg += f" | 상장 전: {insufficient_data}건"
         
         if not results:
             st.warning("결과가 없습니다.")
@@ -324,9 +399,13 @@ with tab1:
                 msg = f"선택하신 날짜({scan_date})에 "
                 parts = []
                 if insufficient_data > 0: parts.append(f"상장 전 종목({insufficient_data}건)")
-                if insufficient_history > 0: parts.append(f"{lookback_sel}주 데이터 부족 종목({insufficient_history}건)")
+                if insufficient_history > 0: parts.append(f"{lookback_sel}주 미만/신규상장({insufficient_history}건)")
                 msg += " 및 ".join(parts) + "이 제외되었습니다."
-                st.info(msg)
+            # [TERMINAL LOG] Summary only (outside if/else to ensure print)
+            print(f"\n[Stock Scanner Summary] {perf_msg}")
+
+            st.info(perf_msg)
+            
         else:
             filtered_results = sorted(results, key=lambda x: x['B/C 상승률'])
             st.session_state['scan_results'] = filtered_results
@@ -335,12 +414,12 @@ with tab1:
             
             st.success(f"{len(filtered_results)}개 종목 발견! (소요 시간: {min_seconds:.1f}초)")
             
-            # 성능 통계 (Screener)
-            perf_msg = f"성능 통계 | 캐시 활용: {cache_rate:.1f}% ({cache_hit}/{total_attempted}) | API 호출: {cache_miss}회"
-            if load_fail > 0: perf_msg += f" | 로드 실패: {load_fail}건"
-            if insufficient_data > 0: perf_msg += f" | 상장 전: {insufficient_data}건"
-            if insufficient_history > 0: perf_msg += f" | {lookback_sel}주 데이터 부족: {insufficient_history}건"
+            # 성능 통계 (Screener) - Moved up
+            # perf_msg construction moved up
+            
             st.info(perf_msg)
+            
+            # [TERMINAL LOG] Summary moved up
             
         # 제외 및 실패 종목 상세 보기
         if load_fail > 0 or insufficient_data > 0 or insufficient_history > 0:
@@ -356,179 +435,184 @@ with tab1:
                         st.caption(", ".join(skip_before_ipo_names))
                 if insufficient_history > 0:
                     with c3:
-                        st.markdown(f"⌛ **{lookback_sel}주 데이터 부족 ({insufficient_history}건)**")
+                        st.markdown(f"⌛ **{lookback_sel}주 미만 / 신규상장 ({insufficient_history}건)**")
                         st.caption(", ".join(skip_low_history_names))
             
             # --- 결과 표시 ---
 
     if 'scan_results' in st.session_state:
-        results = st.session_state['scan_results']
-        
-        df_disp = pd.DataFrame(results)
-        
-        if '수익률' in df_disp.columns and '상태' in df_disp.columns:
-            df_disp['수익률/상태'] = df_disp.apply(
-                lambda row: f"{'+' if row['수익률'] > 0 else ''}{row['수익률']:.1f}% ({row['상태']})" 
-                if pd.notna(row['수익률']) and pd.notna(row['상태']) else '-',
-                axis=1
-            )
-        
-        if 'Max 수익률' in df_disp.columns and 'Max 날짜' in df_disp.columns:
-            df_disp['Max 수익/날짜'] = df_disp.apply(
-                lambda row: f"{'+' if row['Max 수익률'] > 0 else ''}{row['Max 수익률']:.1f}% ({row['Max 날짜']})" 
-                if pd.notna(row['Max 수익률']) and pd.notna(row['Max 날짜']) else '-', axis=1
-            )
-        
-        if 'Min 수익률' in df_disp.columns and 'Min 날짜' in df_disp.columns:
-            df_disp['Min 수익/날짜'] = df_disp.apply(
-                lambda row: f"{'+' if row['Min 수익률'] > 0 else ''}{row['Min 수익률']:.1f}% ({row['Min 날짜']})" 
-                if pd.notna(row['Min 수익률']) and pd.notna(row['Min 날짜']) else '-', axis=1
-            )
+        # [Fix] 시장 변경 시 이전 결과 숨기기
+        if st.session_state.get('scan_market') != market_sel:
+            st.warning(f"⚠️ 현재 표시된 결과는 '{st.session_state.get('scan_market')}' 시장의 결과입니다. '{market_sel}' 시장을 분석하려면 '실시간 종목 스캔 시작' 버튼을 눌러주세요.")
+        else:
+            results = st.session_state['scan_results']
             
-        preferred_cols = [
-            'Code', 'Name', '매수가', '현재가', 'B/C 라인', 'B/C 상승률', 
-            '수익률/상태', 'Max 수익/날짜', 'Min 수익/날짜',
-            '208주 최저', '208주 최고', '현재 구간', '20일선'
-        ]
-        
-        cols_to_show = [c for c in preferred_cols if c in df_disp.columns]
-        df_disp = df_disp[cols_to_show].copy()
-        
-        if 'Code' in df_disp.columns:
-            df_disp['Code'] = df_disp['Code'].apply(lambda x: str(x).zfill(6))
-        
-        # Define price columns for formatting
-        price_cols = ['매수가', '현재가', 'B/C 라인', '208주 최저', '208주 최고']
-        for col in price_cols:
-            if col in df_disp.columns:
-                df_disp[col] = df_disp[col].apply(lambda x: f"{int(x):,}" if pd.notna(x) else x)
-        
-        if 'B/C 상승률' in df_disp.columns:
-            df_disp['B/C 상승률'] = df_disp['B/C 상승률'].apply(lambda x: f"+{x:.1f}%" if x > 0 else f"{x:.1f}%")
+            df_disp = pd.DataFrame(results)
 
-        st.dataframe(df_disp, width='stretch')
-        st.divider()
         
-        # 상세 분석
-        col_list = [f"{r['Name']} ({r['Code']})" for r in results]
-        selected_stock_str = st.selectbox("상세 분석 종목 선택", col_list)
-        
-        if selected_stock_str:
-            sel_idx = col_list.index(selected_stock_str)
-            row_sel = results[sel_idx]
-            
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("종목명", row_sel['Name'])
-            c1.caption(f"Code: {row_sel['Code']}")
-            
-            c2.metric("매수가 (검색일)", f"{int(row_sel['매수가']):,}원")
-            curr_price = row_sel.get('현재가', 0)
-            c2.caption(f"현재가: {int(curr_price):,}원")
-            
-            pnl = row_sel.get('수익률')
-            pnl_str = f"{pnl:+.1f}%" if pnl is not None else "-"
-            c3.metric("수익률", pnl_str)
-            if 'Max 수익률' in row_sel and row_sel['Max 수익률'] is not None:
-                c3.caption(f"Max: {row_sel['Max 수익률']:+.1f}% ({row_sel.get('Max 날짜', '-')})")
-                
-            c4.metric("현재 상태", row_sel.get('상태', '-'))
-            if 'Min 수익률' in row_sel and row_sel['Min 수익률'] is not None:
-                c4.caption(f"Min: {row_sel['Min 수익률']:+.1f}% ({row_sel.get('Min 날짜', '-')})")
-
-            # 보유일 계산 (검색일 기준)
-            s_date = st.session_state.get('scan_date', datetime.now(kst).date())
-            status_str = row_sel.get('상태', '')
-            
-            # 매도일이 있다면 해당 날짜까지, 없으면 오늘까지
-            import re
-            match = re.search(r'\((\d{4}-\d{2}-\d{2})\)', status_str)
-            if match and '매도' in status_str:
-                end_date = pd.Timestamp(match.group(1)).date()
-            else:
-                end_date = datetime.now(kst).date()
-            
-            duration = (end_date - s_date).days
-            c5.metric("보유일", f"{duration}일")
-            
-            st.markdown("#### 차트 분석")
-            df_chart = row_sel['df_daily'].copy()
-            df_chart['MA20'] = df_chart['Close'].rolling(window=20).mean()
-            
-            fig = go.Figure()
-            
-            # 1. Price Line (Thicker, Darker Blue for visibility on white)
-            fig.add_trace(go.Scatter(
-                x=df_chart.index, y=df_chart['Close'], 
-                name='가격', 
-                line=dict(color='#2c3e50', width=2.5) 
-            ))
-            
-            # 2. MA20 (Thinner, Orange)
-            fig.add_trace(go.Scatter(
-                x=df_chart.index, y=df_chart['MA20'], 
-                name='20일선', 
-                line=dict(color='#e67e22', width=1.5, dash='dot')
-            ))
-            
-            # 3. Segments (Subtle Grey)
-            for i, level in enumerate(row_sel['segments']):
-                fig.add_hline(y=level, line_dash="dash", line_color="rgba(150,150,150,0.5)", line_width=1)
-            
-            # 4. BUY Signal (Vertical Line + Text)
-            scan_date_ts = pd.Timestamp(st.session_state.get('scan_date', datetime.now().date()))
-            valid_dates = df_chart[df_chart.index <= scan_date_ts].index
-            
-            if len(valid_dates) > 0:
-                buy_date = valid_dates[-1]
-                
-                # Vertical Line
-                fig.add_vline(x=buy_date, line_width=1, line_dash="solid", line_color="#e74c3c")
-                
-                # Text Label (Bottom)
-                fig.add_annotation(
-                    x=buy_date, y=0.02, yref="paper",
-                    text="<b>BUY</b>",
-                    showarrow=False,
-                    font=dict(color="#e74c3c", size=14),
-                    bgcolor="rgba(255,255,255,0.7)",
-                    yanchor="bottom"
+            if '수익률' in df_disp.columns and '상태' in df_disp.columns:
+                df_disp['수익률/상태'] = df_disp.apply(
+                    lambda row: f"{'+' if row['수익률'] > 0 else ''}{row['수익률']:.1f}% ({row['상태']})" 
+                    if pd.notna(row['수익률']) and pd.notna(row['상태']) else '-',
+                    axis=1
                 )
             
-            # 5. SELL Signal (Vertical Line + Text)
-            if '상태' in row_sel and '매도' in row_sel['상태']:
-                import re
-                match = re.search(r'\((\d{4}-\d{2}-\d{2})\)', row_sel['상태'])
-                if match:
-                    sell_date_str = match.group(1)
-                    sell_date_ts = pd.Timestamp(sell_date_str)
-                    valid_sell_dates = df_chart[df_chart.index <= sell_date_ts].index
-                    if len(valid_sell_dates) > 0:
-                        sell_date = valid_sell_dates[-1]
-                        
-                        # Vertical Line
-                        fig.add_vline(x=sell_date, line_width=1, line_dash="solid", line_color="#3498db")
-                        
-                        # Text Label (Top)
-                        fig.add_annotation(
-                            x=sell_date, y=0.98, yref="paper",
-                            text="<b>SELL</b>",
-                            showarrow=False,
-                            font=dict(color="#3498db", size=14),
-                            bgcolor="rgba(255,255,255,0.7)",
-                            yanchor="top"
-                        )
+            if 'Max 수익률' in df_disp.columns and 'Max 날짜' in df_disp.columns:
+                df_disp['Max 수익/날짜'] = df_disp.apply(
+                    lambda row: f"{'+' if row['Max 수익률'] > 0 else ''}{row['Max 수익률']:.1f}% ({row['Max 날짜']})" 
+                    if pd.notna(row['Max 수익률']) and pd.notna(row['Max 날짜']) else '-', axis=1
+                )
             
-            fig.update_layout(
-                template="plotly_white", 
-                height=600, 
-                hovermode='x unified', 
-                showlegend=True,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                margin=dict(l=20, r=20, t=50, b=20),
-                xaxis=dict(showgrid=True, gridcolor='rgba(230,230,230,0.5)'),
-                yaxis=dict(showgrid=True, gridcolor='rgba(230,230,230,0.5)')
-            )
-            st.plotly_chart(fig, width='stretch')
+            if 'Min 수익률' in df_disp.columns and 'Min 날짜' in df_disp.columns:
+                df_disp['Min 수익/날짜'] = df_disp.apply(
+                    lambda row: f"{'+' if row['Min 수익률'] > 0 else ''}{row['Min 수익률']:.1f}% ({row['Min 날짜']})" 
+                    if pd.notna(row['Min 수익률']) and pd.notna(row['Min 날짜']) else '-', axis=1
+                )
+                
+            preferred_cols = [
+                'Code', 'Name', '매수가', '현재가', 'B/C 라인', 'B/C 상승률', 
+                '수익률/상태', 'Max 수익/날짜', 'Min 수익/날짜',
+                '208주 최저', '208주 최고', '현재 구간', '20일선'
+            ]
+            
+            cols_to_show = [c for c in preferred_cols if c in df_disp.columns]
+            df_disp = df_disp[cols_to_show].copy()
+            
+            if 'Code' in df_disp.columns:
+                df_disp['Code'] = df_disp['Code'].apply(lambda x: str(x).zfill(6))
+            
+            # Define price columns for formatting
+            price_cols = ['매수가', '현재가', 'B/C 라인', '208주 최저', '208주 최고']
+            for col in price_cols:
+                if col in df_disp.columns:
+                    df_disp[col] = df_disp[col].apply(lambda x: f"{int(x):,}" if pd.notna(x) else x)
+            
+            if 'B/C 상승률' in df_disp.columns:
+                df_disp['B/C 상승률'] = df_disp['B/C 상승률'].apply(lambda x: f"+{x:.1f}%" if x > 0 else f"{x:.1f}%")
+
+            st.dataframe(df_disp, width='stretch')
+            st.divider()
+            
+            # 상세 분석
+            col_list = [f"{r['Name']} ({r['Code']})" for r in results]
+            selected_stock_str = st.selectbox("상세 분석 종목 선택", col_list)
+            
+            if selected_stock_str:
+                sel_idx = col_list.index(selected_stock_str)
+                row_sel = results[sel_idx]
+                
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("종목명", row_sel['Name'])
+                c1.caption(f"Code: {row_sel['Code']}")
+                
+                c2.metric("매수가 (검색일)", f"{int(row_sel['매수가']):,}원")
+                curr_price = row_sel.get('현재가', 0)
+                c2.caption(f"현재가: {int(curr_price):,}원")
+                
+                pnl = row_sel.get('수익률')
+                pnl_str = f"{pnl:+.1f}%" if pnl is not None else "-"
+                c3.metric("수익률", pnl_str)
+                if 'Max 수익률' in row_sel and row_sel['Max 수익률'] is not None:
+                    c3.caption(f"Max: {row_sel['Max 수익률']:+.1f}% ({row_sel.get('Max 날짜', '-')})")
+                    
+                c4.metric("현재 상태", row_sel.get('상태', '-'))
+                if 'Min 수익률' in row_sel and row_sel['Min 수익률'] is not None:
+                    c4.caption(f"Min: {row_sel['Min 수익률']:+.1f}% ({row_sel.get('Min 날짜', '-')})")
+    
+                # 보유일 계산 (검색일 기준)
+                s_date = st.session_state.get('scan_date', datetime.now(kst).date())
+                status_str = row_sel.get('상태', '')
+                
+                # 매도일이 있다면 해당 날짜까지, 없으면 오늘까지
+                import re
+                match = re.search(r'\((\d{4}-\d{2}-\d{2})\)', status_str)
+                if match and '매도' in status_str:
+                    end_date = pd.Timestamp(match.group(1)).date()
+                else:
+                    end_date = datetime.now(kst).date()
+                
+                duration = (end_date - s_date).days
+                c5.metric("보유일", f"{duration}일")
+                
+                st.markdown("#### 차트 분석")
+                df_chart = row_sel['df_daily'].copy()
+                df_chart['MA20'] = df_chart['Close'].rolling(window=20).mean()
+                
+                fig = go.Figure()
+                
+                # 1. Price Line (Thicker, Darker Blue for visibility on white)
+                fig.add_trace(go.Scatter(
+                    x=df_chart.index, y=df_chart['Close'], 
+                    name='가격', 
+                    line=dict(color='#2c3e50', width=2.5) 
+                ))
+                
+                # 2. MA20 (Thinner, Orange)
+                fig.add_trace(go.Scatter(
+                    x=df_chart.index, y=df_chart['MA20'], 
+                    name='20일선', 
+                    line=dict(color='#e67e22', width=1.5, dash='dot')
+                ))
+                
+                # 3. Segments (Subtle Grey)
+                for i, level in enumerate(row_sel['segments']):
+                    fig.add_hline(y=level, line_dash="dash", line_color="rgba(150,150,150,0.5)", line_width=1)
+                
+                # 4. BUY Signal (Vertical Line + Text)
+                scan_date_ts = pd.Timestamp(st.session_state.get('scan_date', datetime.now().date()))
+                valid_dates = df_chart[df_chart.index <= scan_date_ts].index
+                
+                if len(valid_dates) > 0:
+                    buy_date = valid_dates[-1]
+                    
+                    # Vertical Line
+                    fig.add_vline(x=buy_date, line_width=1, line_dash="solid", line_color="#e74c3c")
+                    
+                    # Text Label (Bottom)
+                    fig.add_annotation(
+                        x=buy_date, y=0.02, yref="paper",
+                        text="<b>BUY</b>",
+                        showarrow=False,
+                        font=dict(color="#e74c3c", size=14),
+                        bgcolor="rgba(255,255,255,0.7)",
+                        yanchor="bottom"
+                    )
+                
+                # 5. SELL Signal (Vertical Line + Text)
+                if '상태' in row_sel and '매도' in row_sel['상태']:
+                    import re
+                    match = re.search(r'\((\d{4}-\d{2}-\d{2})\)', row_sel['상태'])
+                    if match:
+                        sell_date_str = match.group(1)
+                        sell_date_ts = pd.Timestamp(sell_date_str)
+                        valid_sell_dates = df_chart[df_chart.index <= sell_date_ts].index
+                        if len(valid_sell_dates) > 0:
+                            sell_date = valid_sell_dates[-1]
+                            
+                            # Vertical Line
+                            fig.add_vline(x=sell_date, line_width=1, line_dash="solid", line_color="#3498db")
+                            
+                            # Text Label (Top)
+                            fig.add_annotation(
+                                x=sell_date, y=0.98, yref="paper",
+                                text="<b>SELL</b>",
+                                showarrow=False,
+                                font=dict(color="#3498db", size=14),
+                                bgcolor="rgba(255,255,255,0.7)",
+                                yanchor="top"
+                            )
+                
+                fig.update_layout(
+                    template="plotly_white", 
+                    height=600, 
+                    hovermode='x unified', 
+                    showlegend=True,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(l=20, r=20, t=50, b=20),
+                    xaxis=dict(showgrid=True, gridcolor='rgba(230,230,230,0.5)'),
+                    yaxis=dict(showgrid=True, gridcolor='rgba(230,230,230,0.5)')
+                )
+                st.plotly_chart(fig, width='stretch')
 
 with tab2:
     st.subheader("초고속 백테스팅")
@@ -744,21 +828,23 @@ with tab2:
     if st.button("초고속 분석 시작"):
         # [Point-in-Time Universe] 백테스트 시작일 기준 시총 리스트 가져오기 (생존편향 제거)
         with st.spinner(f"{bt_start.strftime('%Y-%m-%d')} 기준 {market_sel} 시총 상위 {n_stocks_sel}개 종목 리스트를 구성 중..."):
-            stock_list = get_historical_market_cap_list(bt_start.strftime('%Y%m%d'), market_sel, n_stocks_sel)
+            stock_list, source = loader.get_stock_universe_for_date(bt_start, market_sel, n_stocks_sel)
         
-        if stock_list is None or stock_list.empty:
+        # Display source information
+        if source.startswith('snapshot_'):
+            date_used = source.split('_')[1]
+            st.success(f"✅ {date_used} 스냅샷 사용 (생존편향 제거됨)")
+        elif source == 'historical_pykrx':
+            st.success(f"✅ {bt_start.strftime('%Y-%m-%d')} pykrx 데이터 사용 (생존편향 제거됨)")
+        else:
             st.warning(
-                f"{bt_start.strftime('%Y-%m-%d')} 기준 유니버스를 구성할 수 없어 현재 시점 리스트를 사용합니다.",
+                f"{bt_start.strftime('%Y-%m-%d')} 이전 스냅샷 없음. 현재 시점 리스트를 사용합니다.",
                 icon="⚠️"
             )
             st.info(
-                "**참고**: 외부 라이브러리(pykrx) 오류로 인해 과거 시점의 전체 종목 리스트를 가져오지 못했습니다. "
-                "하지만 개별 종목의 과거 가격 데이터는 정상적으로 호출하여 백테스트를 진행합니다.",
-                icon="ℹ️"
+                "**참고**: 지금부터 스냅샷을 저장하면 미래 백테스트에서 생존편향을 제거할 수 있습니다!",
+                icon="💡"
             )
-            stock_list = get_stock_list_naver(market_sel, n_stocks_sel)
-        else:
-            st.success(f"{bt_start.strftime('%Y-%m-%d')} 기준 유니버스로 백테스트를 진행합니다. (생존편향 제거됨)")
         
         # [NOTE] 과거 시점 유니버스일 경우, 현재 스크리너 결과를 합치는 것은 논리적으로 맞지 않을 수 있음
         # 하지만 사용자가 "현재 관심 종목"의 과거 성과도 보고 싶을 수 있으므로 옵션으로 유지하거나
@@ -974,7 +1060,7 @@ with tab2:
         
         # Explicit order for presentation
         final_cols = [
-            'No.', 'Name', '매수가', '현재가/매도가', 
+            'No.', 'Code', 'Name', '매수가', '현재가/매도가', 
             '보유 수익률 (%)', '실현 수익률 (%)', 
             'Max 수익/날짜', 'Min 수익/날짜', 
             '누적 수익률 (%)', 'Trades', 'Win Rate (%)', 
@@ -1005,7 +1091,69 @@ with tab2:
             df_summary_display['매수가'] = df_summary_display['매수가'].apply(lambda x: f"{int(x):,}" if pd.notna(x) and x != '-' else x)
         if '현재가/매도가' in df_summary_display.columns:
             df_summary_display['현재가/매도가'] = df_summary_display['현재가/매도가'].apply(lambda x: f"{int(x):,}" if pd.notna(x) and x != '-' else x)
-        
+
+        # [NEW] StockEasy 데이터 통합
+        try:
+            # 1. DB에서 최신 데이터 가져오기
+            codes = df_summary['Ticker'].tolist()
+            se_df = get_db().get_latest_data(codes)
+            
+            # 2. 컬럼 기본값으로 초기화 (항상 표시되도록)
+            se_columns = ['종합점수', '재무점수', '재무', '성장', '수익성', '안정성', '밸류']
+            for col in se_columns:
+                df_summary_display[col] = '-'
+            
+            if not se_df.empty:
+                # 3. 사용 가능한 컬럼 매핑
+                rename_map = {
+                    'composite_score': '종합점수',
+                    'financial_score': '재무점수', 
+                    'financial_grade': '재무',
+                    'growth_grade': '성장',
+                    'profitability_grade': '수익성',
+                    'stability_grade': '안정성',
+                    'valuation_grade': '밸류'
+                }
+                
+                available_cols = [c for c in rename_map.keys() if c in se_df.columns]
+                
+                if available_cols:
+                    se_subset = se_df[['code'] + available_cols].copy()
+                    se_subset = se_subset.rename(columns={'code': 'Code', **rename_map})
+                    
+                    # 병합 (기존 기본값 덮어쓰기)
+                    df_summary_display = df_summary_display.drop(columns=[rename_map[c] for c in available_cols], errors='ignore')
+                    df_summary_display = pd.merge(df_summary_display, se_subset, on='Code', how='left')
+                
+                # 4. 포맷팅 (점수는 정수로, 등급은 그대로)
+                for col in ['종합점수', '재무점수']:
+                    if col in df_summary_display.columns:
+                        df_summary_display[col] = df_summary_display[col].apply(
+                            lambda x: f"{int(x)}" if pd.notna(x) and x != '-' else "-"
+                        )
+                        
+                for col in ['재무', '성장', '수익성', '안정성', '밸류']:
+                    if col in df_summary_display.columns:
+                        df_summary_display[col] = df_summary_display[col].fillna("-")
+
+            # 5. 컬럼 순서 재배치 (Name 뒤에 StockEasy 데이터 위치)
+            curr_cols = df_summary_display.columns.tolist()
+            base_cols_head = ['No.', 'Code', 'Name']
+            
+            head_exist = [c for c in base_cols_head if c in curr_cols]
+            se_exist = [c for c in se_columns if c in curr_cols]
+            others = [c for c in curr_cols if c not in head_exist and c not in se_exist]
+            
+            final_order = head_exist + se_exist + others
+            df_summary_display = df_summary_display[final_order]
+                
+        except Exception as e:
+            # 통합 실패해도 백테스트 결과는 보여줘야 함
+            print(f"StockEasy data merge failed: {e}")
+            import traceback
+            traceback.print_exc()
+            pass
+
         st.dataframe(df_summary_display, width='stretch', hide_index=True)
         
         # --- Summary Section ---
@@ -1690,6 +1838,9 @@ with tab3:
                     st.error("가격을 가져올 수 없습니다. 코드나 시장 설정을 확인해 주세요.")
             else:
                 st.warning(f"'{search_name}' 종목을 찾을 수 없습니다. 정확한 명칭이나 코드를 입력해 주세요.")
+
+with tab4:
+    stockeasy_view.render_main()
 
 # --- 설정 자동 저장 (맨 마지막에 배치하여 모든 위젯 값 수집) ---
 all_current_settings = {
