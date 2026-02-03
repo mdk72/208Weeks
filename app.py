@@ -539,6 +539,12 @@ with tab1:
                 c5.metric("보유일", f"{duration}일")
                 
                 st.markdown("#### 차트 분석")
+                
+                # Checkbox for Dynamic Boundaries
+                col_c1, col_c2 = st.columns([3, 1])
+                with col_c2:
+                    show_dynamic_screener = st.checkbox("동적 경계선 보기", key="dyn_bound_screener", help="208주 최고/최저가를 기반으로 변동하는 동적 경계선을 차트에 표시합니다.")
+
                 df_chart = row_sel['df_daily'].copy()
                 df_chart['MA20'] = df_chart['Close'].rolling(window=20).mean()
                 
@@ -558,9 +564,35 @@ with tab1:
                     line=dict(color='#e67e22', width=1.5, dash='dot')
                 ))
                 
-                # 3. Segments (Subtle Grey)
-                for i, level in enumerate(row_sel['segments']):
-                    fig.add_hline(y=level, line_dash="dash", line_color="rgba(150,150,150,0.5)", line_width=1)
+                # 3. Segments (Dynamic vs Static)
+                if show_dynamic_screener and 'RollHigh' in df_chart.columns and 'RollLow' in df_chart.columns:
+                    # Dynamic Boundaries (Rolling)
+                    r_high = df_chart['RollHigh']
+                    r_low = df_chart['RollLow']
+                    r_step = (r_high - r_low) / 6
+                    
+                    boundary_names = ["A/B (1/6)", "B/C (2/6)", "C/D (3/6)", "D/E (4/6)", "E/F (5/6)"]
+                    colors = ["rgba(150,150,150,0.3)", "rgba(100,100,100,0.5)", "rgba(100,100,100,0.5)", "rgba(100,100,100,0.5)", "rgba(150,150,150,0.3)"]
+                    
+                    for j in range(1, 6):
+                        line_val = r_low + j * r_step
+                        fig.add_trace(go.Scatter(
+                            x=df_chart.index, y=line_val,
+                            name=boundary_names[j-1],
+                            line=dict(color=colors[j-1], width=1, dash='dash'),
+                            hoverinfo='skip',
+                            showlegend=True
+                        ))
+                        
+                    # 208-Week Low/High
+                    fig.add_trace(go.Scatter(x=df_chart.index, y=r_low, name='208주 최저', line=dict(color='rgba(200,50,50,0.3)', width=1), showlegend=True))
+                    fig.add_trace(go.Scatter(x=df_chart.index, y=r_high, name='208주 최고', line=dict(color='rgba(50,50,200,0.3)', width=1), showlegend=True))
+                    
+                else:
+                    # Static Segments (Original)
+                    # Use the latest calculated segments from the row data
+                    for i, level in enumerate(row_sel['segments']):
+                        fig.add_hline(y=level, line_dash="dash", line_color="rgba(150,150,150,0.5)", line_width=1)
                 
                 # 4. BUY Signal (Vertical Line + Text)
                 scan_date_ts = pd.Timestamp(st.session_state.get('scan_date', datetime.now().date()))
