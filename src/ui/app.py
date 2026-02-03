@@ -2,9 +2,11 @@ import sys
 import os
 
 # root path for relative imports
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Calculate based on the absolute path of this file (src/ui/app.py -> src -> project root)
+CURRENT_FILE_PATH = os.path.abspath(__file__)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(CURRENT_FILE_PATH)))
 if BASE_DIR not in sys.path:
-    sys.path.append(BASE_DIR)
+    sys.path.insert(0, BASE_DIR)
 
 import streamlit as st
 import pandas as pd
